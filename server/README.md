@@ -18,7 +18,7 @@ is gitignored.
 `POST /collect` is deliberately open so the browser can send dots without credentials. Viewing the
 data requires HTTP Basic auth:
 
-- Pages: `/`, `/data`, `/data/dots-YYYY-MM-DD.json`
+- Pages: `/`, `/data`, `/data/dots-YYYY-MM-DD/<sessionId>.json`
 - Username / password: `COLLECT_USER` / `COLLECT_PASS` in `server/.env`
 - Open the URL in a browser and enter the credentials in the browser prompt.
 
@@ -95,14 +95,20 @@ login, while the page posts in the background with `fetch`.
 | --- | --- |
 | `POST /collect` | Saves one JSON event |
 | `GET /` | Simple file listing page |
-| `GET /data` | Lists JSON files and event counts |
-| `GET /data/dots-YYYY-MM-DD.json` | Returns one day's events |
+| `GET /data` | Lists JSON files and event counts, including sessions |
+| `GET /data/dots-YYYY-MM-DD/<sessionId>.json` | Returns one session's events for a day |
+| `GET /data/dots-YYYY-MM-DD.json` | Returns the older all-sessions file for a day, if present |
 | `GET /health` | Health check |
 
 ## What gets saved
 
-Each POST is appended to `server/data/dots-YYYY-MM-DD.json` as an array of events. The newest
-event is also written to `server/data/latest.json`. These files are gitignored.
+Each POST is appended to `server/data/dots-YYYY-MM-DD/<sessionId>.json` as an array of events, so
+each browser session has its own file per day. Events without a usable `sessionId` go to
+`unknown.json`. The newest event across all sessions is also written to
+`server/data/latest.json`. These files are gitignored.
+
+Older `server/data/dots-YYYY-MM-DD.json` files are left in place and are still listed and served;
+new events are no longer added to them.
 
 The page sends exactly two events per push-up: `push_down` with `value: 1` when the bottom pose
 is reached, and `push_up` with `value: 1` when the top pose completes the rep. Both events carry

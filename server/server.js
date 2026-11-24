@@ -46,6 +46,11 @@ const COLLECT_USER = process.env.COLLECT_USER || "";
 const COLLECT_PASS = process.env.COLLECT_PASS || "";
 const CLOUDFLARE_URL = process.env.CLOUDFLARE_URL || "";
 const AUTH_ENABLED = Boolean(COLLECT_USER && COLLECT_PASS);
+const DAY_DIR_PATTERN = /^dots-(\d{4}-\d{2}-\d{2}|unknown)$/;
+const LEGACY_FILE_PATTERN = /^dots-\d{4}-\d{2}-\d{2}\.json$/;
+const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const SESSION_FILE_PATTERN = /^([A-Za-z0-9_-]{1,128})\.json$/;
+const UNKNOWN_SESSION = "unknown";
 
 function publicCollectUrl() {
   const base = CLOUDFLARE_URL.replace(/\/+$/, "");
@@ -115,10 +120,19 @@ function dayFrom(timestamp) {
   return Number.isNaN(date.getTime()) ? "unknown" : date.toISOString().slice(0, 10);
 }
 
+function sessionFrom(record) {
+  const sessionId = typeof record.sessionId === "string" ? record.sessionId.trim() : "";
+  return SESSION_ID_PATTERN.test(sessionId) ? sessionId : UNKNOWN_SESSION;
+}
+
 function appendEvent(record) {
-  const file = path.join(DATA_DIR, `dots-${dayFrom(record.receivedAt)}.json`);
+  const dayDir = `dots-${dayFrom(record.receivedAt)}`;
+  const sessionName = sessionFrom(record);
+  const file = path.join(DATA_DIR, dayDir, `${sessionName}.json`);
+  const relativeName = `${dayDir}/${sessionName}.json`;
 
   const task = writeChain.catch(() => {}).then(async () => {
+    await fsp.mkdir(path.dirname(file), { recursive: true });
     let events = [];
     try {
       const parsed = JSON.parse(await fsp.readFile(file, "utf8"));
@@ -136,47 +150,92 @@ function appendEvent(record) {
       `${JSON.stringify(record, null, 2)}\n`,
       "utf8",
     );
-    return path.basename(file);
+    return relativeName;
   });
 
   writeChain = task.catch((error) => console.error(`Could not save event: ${error.message}`));
   return task;
 }
 
+async function describeDataFile(fullPath, name, sessionId = null) {
+  const stat = await fsp.stat(fullPath);
+  let events = 0;
+  try {
+    const parsed = JSON.parse(await fsp.readFile(fullPath, "utf8"));
+    if (Array.isArray(parsed)) events = parsed.length;
+  } catch {
+    events = 0;
+  }
+  return {
+    name,
+    sessionId,
+    events,
+    bytes: stat.size,
+    updatedAt: stat.mtime.toISOString(),
+  };
+}
+
 async function listDataFiles() {
   const entries = await fsp.readdir(DATA_DIR, { withFileTypes: true });
-  const files = await Promise.all(
-    entries
-      .filter((entry) => entry.isFile() && /^dots-\d{4}-\d{2}-\d{2}\.json$/.test(entry.name))
-      .map(async (entry) => {
-        const fullPath = path.join(DATA_DIR, entry.name);
-        const stat = await fsp.stat(fullPath);
-        let count = 0;
-        try {
-          const parsed = JSON.parse(await fsp.readFile(fullPath, "utf8"));
-          if (Array.isArray(parsed)) count = parsed.length;
-        } catch {
-          count = 0;
-        }
-        return {
-          name: entry.name,
-          events: count,
-          bytes: stat.size,
-          updatedAt: stat.mtime.toISOString(),
-        };
-      }),
-  );
+  const files = [];
+
+  for (const entry of entries) {
+    if (entry.isFile() && LEGACY_FILE_PATTERN.test(entry.name)) {
+      files.push(await describeDataFile(path.join(DATA_DIR, entry.name), entry.name));
+      continue;
+    }
+    if (!entry.isDirectory() || !DAY_DIR_PATTERN.test(entry.name)) continue;
+
+    const dayDir = path.join(DATA_DIR, entry.name);
+    const sessionEntries = await fsp.readdir(dayDir, { withFileTypes: true });
+    for (const sessionEntry of sessionEntries) {
+      if (!sessionEntry.isFile()) continue;
+      const match = SESSION_FILE_PATTERN.exec(sessionEntry.name);
+      if (!match) continue;
+      files.push(
+        await describeDataFile(
+          path.join(dayDir, sessionEntry.name),
+          `${entry.name}/${sessionEntry.name}`,
+          match[1],
+        ),
+      );
+    }
+  }
+
   return files.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function dataFilePath(name) {
+  const segments = name.split("/");
+  let relative;
+
+  if (segments.length === 1) {
+    const file = segments[0];
+    if (!file || file !== path.basename(file) || !file.endsWith(".json")) return null;
+    relative = [file];
+  } else if (
+    segments.length === 2 &&
+    DAY_DIR_PATTERN.test(segments[0]) &&
+    SESSION_FILE_PATTERN.test(segments[1])
+  ) {
+    relative = segments;
+  } else {
+    return null;
+  }
+
+  const fullPath = path.join(DATA_DIR, ...relative);
+  const dataRoot = DATA_DIR.endsWith(path.sep) ? DATA_DIR : `${DATA_DIR}${path.sep}`;
+  return fullPath.startsWith(dataRoot) ? fullPath : null;
 }
 
 function renderIndex(files) {
   const collectUrl = publicCollectUrl();
   const items = files.length
     ? files
-        .map(
-          (file) =>
-            `<li><a href="/data/${encodeURIComponent(file.name)}">${file.name}</a> — ${file.events} events, ${file.bytes} bytes</li>`,
-        )
+        .map((file) => {
+          const href = `/data/${file.name.split("/").map(encodeURIComponent).join("/")}`;
+          return `<li><a href="${href}">${escapeHtml(file.name)}</a>${file.sessionId ? ` — session <code>${escapeHtml(file.sessionId)}</code>` : ""} — ${file.events} events, ${file.bytes} bytes</li>`;
+        })
         .join("")
     : "<li>No events yet. POST JSON to /collect.</li>";
 
@@ -319,12 +378,13 @@ const server = http.createServer(async (req, res) => {
         send(res, 400, { ok: false, error: "Bad file name" });
         return;
       }
-      if (!name || name !== path.basename(name) || !name.endsWith(".json")) {
+      const fullPath = dataFilePath(name);
+      if (!fullPath) {
         send(res, 400, { ok: false, error: "Bad file name" });
         return;
       }
       try {
-        const text = await fsp.readFile(path.join(DATA_DIR, name), "utf8");
+        const text = await fsp.readFile(fullPath, "utf8");
         send(res, 200, text);
       } catch (error) {
         send(res, error.code === "ENOENT" ? 404 : 500, {

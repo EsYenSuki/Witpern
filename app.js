@@ -4,11 +4,16 @@ const POSE_STABLE_MS = 200;
 const HOLD_MS = 100;
 const ANGLE_TOLERANCE = 25;
 const CIRCLE_DOWN_BIAS = 0.2;
+const TORSO_TO_HAND_MAX = 0.5;
 const MIN_REP_GAP_MS = 200;
 const LANDMARK_HISTORY_LIMIT = 180;
 const LANDMARK_SAMPLE_EVERY = 3;
 const CAPTURE_DOTS_LIMIT = 20;
 const EXPORT_FORMAT = "posetrack-pushup";
+const SEND_FORMAT = "posetrack-dot-events";
+const SEND_TIMEOUT_MS = 8000;
+const SEND_PENDING_LIMIT = 50;
+const SEND_SETTINGS_KEY = "posetrack.send";
 
 const DEFAULT_DOWN_REACH = 0.965;
 const DEFAULT_DOWN_ANGLE = 145;
@@ -43,6 +48,15 @@ const state = {
   landmarkFrame: 0,
   capturedDots: [],
   captureId: 0,
+  sender: {
+    enabled: false,
+    endpoint: "",
+    sessionId: "",
+    eventSeq: 0,
+    pending: [],
+    sending: false,
+    status: { text: "Server URL not set.", kind: "idle" },
+  },
   pushup: {
     phase: "waiting",
     count: 0,
@@ -81,6 +95,7 @@ document.addEventListener("DOMContentLoaded", init);
 async function init() {
   cacheElements();
   bindEvents();
+  restoreSendSettings();
 
   setFacingMode(state.facingMode, { restart: false });
   updateConfidenceLabel();
@@ -161,6 +176,11 @@ function cacheElements() {
   els.captureList = document.getElementById("captureList");
   els.selectAllCapturesBtn = document.getElementById("selectAllCapturesBtn");
   els.downloadSelectedBtn = document.getElementById("downloadSelectedBtn");
+  els.sendEndpoint = document.getElementById("sendEndpoint");
+  els.sendEnabled = document.getElementById("sendEnabled");
+  els.sendTestBtn = document.getElementById("sendTestBtn");
+  els.sendRetryBtn = document.getElementById("sendRetryBtn");
+  els.sendStatus = document.getElementById("sendStatus");
   els.openCameraBtn = document.getElementById("openCameraBtn");
   els.closeCameraBtn = document.getElementById("closeCameraBtn");
   els.frontCamBtn = document.getElementById("frontCamBtn");
@@ -210,6 +230,11 @@ function bindEvents() {
   });
   els.mirror.addEventListener("change", applyMirrorClass);
   els.skipCalibration.addEventListener("change", resetPushup);
+
+  els.sendEndpoint.addEventListener("change", saveSendSettings);
+  els.sendEnabled.addEventListener("change", saveSendSettings);
+  els.sendTestBtn.addEventListener("click", testSend);
+  els.sendRetryBtn.addEventListener("click", flushPendingEvents);
 }
 
 async function openCamera() {
@@ -493,6 +518,251 @@ function downloadSelectedCaptures() {
   );
 
   setMessage(`Downloaded ${selected.length} capture${selected.length === 1 ? "" : "s"}.`, "success");
+}
+
+function makeSessionId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getSessionId() {
+  try {
+    const stored = sessionStorage.getItem("posetrack.sessionId");
+    if (stored) return stored;
+    const id = makeSessionId();
+    sessionStorage.setItem("posetrack.sessionId", id);
+    return id;
+  } catch {
+    return makeSessionId();
+  }
+}
+
+function normalizeSendEndpoint(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  try {
+    const url = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!url.hostname) return "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function restoreSendSettings() {
+  const sender = state.sender;
+  sender.sessionId = getSessionId();
+
+  try {
+    const saved = JSON.parse(localStorage.getItem(SEND_SETTINGS_KEY) || "{}");
+    if (typeof saved.endpoint === "string") {
+      sender.endpoint = normalizeSendEndpoint(saved.endpoint);
+      els.sendEndpoint.value = saved.endpoint;
+    }
+    sender.enabled = Boolean(saved.enabled) && Boolean(sender.endpoint);
+  } catch {
+    sender.enabled = false;
+  }
+
+  els.sendEnabled.checked = sender.enabled;
+  setSendReadyStatus();
+}
+
+function saveSendSettings() {
+  const endpoint = normalizeSendEndpoint(els.sendEndpoint.value);
+  const enabled = els.sendEnabled.checked && Boolean(endpoint);
+
+  state.sender.endpoint = endpoint;
+  state.sender.enabled = enabled;
+  if (!endpoint) els.sendEnabled.checked = false;
+
+  try {
+    localStorage.setItem(
+      SEND_SETTINGS_KEY,
+      JSON.stringify({ endpoint: els.sendEndpoint.value.trim(), enabled }),
+    );
+  } catch {
+    // Storage can be unavailable (private mode); sending still works for this page load.
+  }
+
+  setSendReadyStatus();
+}
+
+function isSendReady() {
+  return state.sender.enabled && Boolean(state.sender.endpoint);
+}
+
+function sendableNumber(value) {
+  return Number.isFinite(value) ? roundNumber(value) : null;
+}
+
+function buildSendEvent(event) {
+  const sender = state.sender;
+  const pushup = state.pushup;
+  sender.eventSeq += 1;
+
+  const dots = state.lastLandmarks.map((point, index) => ({
+    index,
+    x: roundNumber(point.x),
+    y: roundNumber(point.y),
+    z: roundNumber(point.z),
+    visibility: roundNumber(point.visibility),
+  }));
+
+  return {
+    format: SEND_FORMAT,
+    version: 1,
+    event,
+    value: 1,
+    eventId: `${sender.sessionId}-${sender.eventSeq}`,
+    sessionId: sender.sessionId,
+    sentAt: new Date().toISOString(),
+    frame: state.landmarkFrame,
+    repCount: pushup.count,
+    calibration: {
+      phase: pushup.phase,
+      downAngle: sendableNumber(pushup.downAngle),
+      upAngle: sendableNumber(pushup.upAngle),
+      downReach: sendableNumber(pushup.downReach),
+      upReach: sendableNumber(pushup.upReach),
+      angleThreshold: sendableNumber(pushup.angleThreshold),
+      thresholdRadius: sendableNumber(pushup.thresholdRadius),
+    },
+    metrics: {
+      leftAngle: sendableNumber(pushup.leftAngle),
+      rightAngle: sendableNumber(pushup.rightAngle),
+      leftDist: sendableNumber(pushup.leftDist),
+      rightDist: sendableNumber(pushup.rightDist),
+      armLength: sendableNumber(pushup.armLength),
+      leftInside: pushup.leftInside,
+      rightInside: pushup.rightInside,
+      elbowPass: pushup.elbowPass,
+      anglePass: pushup.anglePass,
+      circlePass: pushup.circlePass,
+    },
+    dotCount: dots.length,
+    dots,
+  };
+}
+
+function sendDotEvent(event) {
+  if (!isSendReady()) return;
+  void dispatchSendEvent(buildSendEvent(event));
+}
+
+async function dispatchSendEvent(event) {
+  const sender = state.sender;
+  if (sender.sending) {
+    queueSendEvent(event);
+    return;
+  }
+
+  sender.sending = true;
+  updateSendStatus(`Sending ${event.event}…`);
+
+  const ok = await postSendEvent(event);
+  if (!ok) {
+    queueSendEvent(event);
+  } else {
+    while (sender.pending.length) {
+      const next = sender.pending[0];
+      updateSendStatus(`Sending queued ${next.event}…`);
+      if (!(await postSendEvent(next))) break;
+      sender.pending.shift();
+    }
+  }
+
+  sender.sending = false;
+  updateSendStatus();
+}
+
+function queueSendEvent(event) {
+  const pending = state.sender.pending;
+  pending.push(event);
+  while (pending.length > SEND_PENDING_LIMIT) pending.shift();
+  updateSendStatus();
+}
+
+async function postSendEvent(event) {
+  if (!state.sender.endpoint) return false;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(state.sender.endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+      signal: controller.signal,
+      keepalive: true,
+    });
+    if (!response.ok) throw new Error(`server returned ${response.status}`);
+    updateSendStatus(`Sent ${event.event} = 1 · ${new Date().toLocaleTimeString()}`, "success");
+    return true;
+  } catch (error) {
+    const reason = error.name === "AbortError" ? "timed out" : error.message || String(error);
+    updateSendStatus(`Send failed (${reason}). Event kept for retry.`, "error");
+    console.warn("PoseTrack send failed:", error);
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function flushPendingEvents() {
+  const sender = state.sender;
+  if (!isSendReady() || sender.sending || !sender.pending.length) return;
+
+  sender.sending = true;
+  updateSendStatus();
+  while (sender.pending.length) {
+    const next = sender.pending[0];
+    if (!(await postSendEvent(next))) break;
+    sender.pending.shift();
+  }
+  sender.sending = false;
+  updateSendStatus();
+}
+
+function testSend() {
+  const endpoint = normalizeSendEndpoint(els.sendEndpoint.value);
+  if (!endpoint) {
+    setMessage("Enter your ngrok URL first, then test the connection.", "warn");
+    els.sendEndpoint.focus();
+    return;
+  }
+
+  state.sender.endpoint = endpoint;
+  state.sender.enabled = true;
+  els.sendEnabled.checked = true;
+  saveSendSettings();
+  void dispatchSendEvent(buildSendEvent("test"));
+  setMessage("Test event sent. Check the send status below.", "info");
+}
+
+function setSendReadyStatus() {
+  const sender = state.sender;
+  if (!sender.endpoint) {
+    updateSendStatus("Server URL not set.", "idle");
+  } else if (!sender.enabled) {
+    updateSendStatus("Sending is off.", "idle");
+  } else {
+    updateSendStatus(`Ready · ${sender.endpoint}`, "success");
+  }
+}
+
+function updateSendStatus(text, kind = "idle") {
+  const sender = state.sender;
+  if (text) sender.status = { text, kind };
+
+  els.sendStatus.textContent = sender.status.text;
+  els.sendStatus.dataset.kind = sender.status.kind;
+  els.sendRetryBtn.disabled = !sender.pending.length || sender.sending || !isSendReady();
 }
 
 function drawSkeleton(landmarks) {
@@ -957,7 +1227,7 @@ function updatePushupCounter(metrics, now) {
     pushup.leftAngle = null;
     pushup.rightAngle = null;
     els.armValues.textContent = "elbow pass – · angle pass – · circle pass –";
-    setCounterStatus("Hold the push-up pose to keep counting.", "warn");
+    setCounterStatus("Low push-up pose required — standing is ignored.", "warn");
     return;
   }
 
@@ -990,6 +1260,7 @@ function updatePushupCounter(metrics, now) {
       pushup.circlePass = false;
       pushup.angleExitSince = 0;
       pushup.outsideSince = 0;
+      sendDotEvent("push_down");
     }
   } else {
     pushup.insideSince = 0;
@@ -1025,6 +1296,7 @@ function updatePushupCounter(metrics, now) {
     pushup.outsideSince = 0;
     pushup.lastRepAt = now;
     updateCounterUI();
+    sendDotEvent("push_up");
     const reps = pushup.count;
     setCounterStatus(`${reps} rep${reps === 1 ? "" : "s"} counted. Go down again!`, "good");
     return;
@@ -1079,11 +1351,18 @@ function getPushupMetrics(landmarks) {
   if (leftArmLength < 0.02 || rightArmLength < 0.02) return null;
 
   const armLength = (leftArmLength + rightArmLength) / 2;
+  const handSpan = (
+    distance(leftShoulder, leftWrist) + distance(rightShoulder, rightWrist)
+  ) / 2;
+  if (handSpan < 0.02) return null;
+
+  const torsoToHand = distance(shoulder, hip) / handSpan;
   const headLevel = Math.abs(head.y - shoulder.y) < 0.18;
   const hipLevel = Math.abs(hip.y - shoulder.y) < 0.38;
+  const lowPushupPose = torsoToHand < TORSO_TO_HAND_MAX;
 
   return {
-    inPushupPose: headLevel && hipLevel,
+    inPushupPose: headLevel && hipLevel && lowPushupPose,
     armLength,
     leftAngle: jointAngle(leftShoulder, leftElbow, leftWrist),
     rightAngle: jointAngle(rightShoulder, rightElbow, rightWrist),

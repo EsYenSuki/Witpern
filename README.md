@@ -40,10 +40,29 @@ In the push-up counter card:
 - **Export** downloads the selected JSON file.
 - **Import** loads a previous PoseTrack JSON file. Imported calibration restores counting immediately; imported dots and snapshots are restored for further export.
 
+## Sending dots to your server (ngrok)
+
+The counter can post dot data to your own server while you exercise:
+
+1. In `server/`, run `node server.js`. No npm install needed.
+2. In another terminal, run `ngrok http 8787` (or your configured `PORT`). Cloudflare Tunnel works too — see `server/README.md`.
+3. On the page, paste the ngrok URL with `/collect` appended, e.g.
+   `https://your-name.ngrok-free.app/collect`, into **Send dots to server → Server URL**.
+4. Tick **Enabled** (or press **Test send** to check it). The URL is saved in browser storage.
+
+Exactly two events are sent per push-up: `push_down` with `value: 1` when the bottom pose is
+reached, and `push_up` with `value: 1` when the top pose finishes the rep. Each event includes all
+33 dot positions, the elapsed rep count, and the saved calibration values. If a send fails, the
+event is queued and can be retried with **Retry queued**.
+
+The collector stores events as JSON arrays in `server/data/dots-YYYY-MM-DD.json`, with the newest
+event in `server/data/latest.json`. `POST /collect` needs no login; viewing the data pages requires
+the username/password from `server/.env` (see `.env.example`). See `server/README.md` for details.
+
 ## How it works
 
 1. The page opens the camera automatically.
-2. Counting is enabled when head, shoulders, elbows, wrists and hips are visible. Feet/ankles are not used.
+2. Counting is enabled when head, shoulders, elbows, wrists and hips are visible, and the body is low: hip-to-shoulder distance must be under half the average shoulder-to-hand distance. This blocks standing or raised poses from counting. Feet/ankles are not used.
 3. A large message on the camera tells you **GO DOWN FIRST**. Hold the bottom position for 5 seconds.
 4. DOWN calibration saves your own:
    - bent elbow angle

@@ -144,9 +144,39 @@
             </div>
           </div>
 
+          <div class="send-card">
+            <div class="send-head">
+              <h3>Send dots to server</h3>
+              <span class="badge">2 events / rep</span>
+            </div>
+            <p class="muted">
+              Sends 33 dot positions with <code>push_down = 1</code> at the bottom and
+              <code>push_up = 1</code> at the top.
+            </p>
+            <label class="sr-only" for="sendEndpoint">Server URL</label>
+            <input
+              class="send-input"
+              id="sendEndpoint"
+              type="url"
+              inputmode="url"
+              placeholder="https://your-name.ngrok-free.app/collect"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <label class="toggle send-toggle">
+              <input id="sendEnabled" type="checkbox" />
+              <span>Enabled</span>
+            </label>
+            <div class="send-actions">
+              <button class="mini-btn" id="sendTestBtn" type="button">Test send</button>
+              <button class="mini-btn" id="sendRetryBtn" type="button" disabled>Retry queued</button>
+            </div>
+            <p class="send-status" id="sendStatus" data-kind="idle">Server URL not set.</p>
+          </div>
+
           <div class="note">
             <strong>Local by design</strong>
-            <p>Video frames stay in this browser tab. An internet connection is needed only to load the model files the first time.</p>
+            <p>Video frames stay in this browser tab. Only dot coordinates and counting values are posted to your server.</p>
           </div>
 
           <p class="message" id="message" role="status" aria-live="polite">Loading pose tracker…</p>

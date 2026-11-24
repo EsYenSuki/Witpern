@@ -633,6 +633,78 @@ input[type="range"] {
   margin-top: 8px;
 }
 
+.send-card {
+  margin: 0 0 18px;
+  padding: 16px;
+  border: 1px solid rgba(34, 211, 238, 0.2);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(34, 211, 238, 0.06), rgba(2, 6, 23, 0.22));
+}
+
+.send-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.send-head h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.send-card .muted {
+  margin: 5px 0 10px;
+  font-size: 12px;
+}
+
+.send-card code {
+  color: var(--lime);
+  font-size: 11px;
+}
+
+.send-input {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 10px;
+  background: #111827;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.send-input:focus-visible {
+  border-color: var(--cyan);
+  outline: none;
+}
+
+.send-toggle {
+  margin: 10px 0;
+}
+
+.send-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.send-status {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.send-status[data-kind="success"] {
+  color: #d9f99d;
+}
+
+.send-status[data-kind="error"] {
+  color: #fecaca;
+}
+
 .note {
   padding: 14px;
   border: 1px solid rgba(34, 211, 238, 0.18);

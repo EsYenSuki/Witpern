@@ -1,6 +1,7 @@
 const MEDIAPIPE_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404";
-const HOLD_MS = 100;
-const MIN_REP_GAP_MS = 200;
+const HOLD_MS = 80;
+const MIN_REP_GAP_MS = 250;
+const REP_STATUS_HOLD_MS = 1200;
 const LANDMARK_HISTORY_LIMIT = 180;
 const LANDMARK_SAMPLE_EVERY = 3;
 const CAPTURE_DOTS_LIMIT = 20;
@@ -10,19 +11,35 @@ const SEND_TIMEOUT_MS = 8000;
 const SEND_PENDING_LIMIT = 50;
 const SEND_SETTINGS_KEY = "posetrack.send";
 
-// Fixed counting thresholds — no calibration required.
-// Elbow angle (shoulder–elbow–wrist) zones, averaged across both arms.
-const UP_ANGLE_MIN = 163;   // arms straight: avg angle >= this is the UP pose
-const DOWN_ANGLE_MAX = 155; // arms bent:   avg angle <= this is the DOWN pose
-// Wrist→ear distance / shoulder width: smaller value means the body is lower.
-const PROX_UP_MIN = 1.80;
-const PROX_DOWN_MAX = 1.90;
-// Mirror check: |leftAngle − rightAngle| must stay under this (front-view symmetry).
+// Fixed counting thresholds (aspect-ratio corrected pixel space; works across front, 45°, and side views).
+// Elbow angle (shoulder–elbow–wrist) zones.
+const UP_ANGLE_MIN = 152;       // arms straight: avg angle >= this is the UP pose
+const DOWN_ANGLE_MAX = 125;     // arms bent:     avg angle <= this is the DOWN pose
+const DEEP_BEND_ANGLE_MAX = 118; // unambiguous elbow bend across any camera angle
+// Head→wrist distance divided by stable body scale. Smaller value means the body is lower (DOWN).
+const PROX_UP_MIN = 1.15;
+const PROX_DOWN_MAX = 1.05;
+// Mirror check: |leftAngle − rightAngle| when both arms are visible.
 const MIRROR_MAX_DIFF = 70;
-// Hands must sit below the hips in the image (blocks standing / arm-curl false positives).
-const HANDS_BELOW_HIP_MIN = 0.03;
-// Hold the last known state for this many invalid frames before resetting a rep.
-const GRACE_FRAMES = 5;
+// Vertical hand margin relative to hips (blocks standing / arm-curl false positives while allowing angled views).
+const HANDS_BELOW_HIP_MIN = -0.18;
+// Maximum vertical hip-to-shoulder drop ratio (standing upright is ~1.15–1.50; push-up is typically -0.50 to +0.60).
+const MAX_TORSO_VERTICAL_RATIO = 0.90;
+// Grace period (ms) to preserve rep state through brief tracking dropouts at the bottom of a rep.
+const GRACE_MS = 850;
+// Keep hip-valid memory briefly when chest occludes hips at the bottom of a front-view push-up.
+const HIP_OCCLUSION_MEMORY_MS = 2500;
+// Landmark visibility thresholds (lower than 0.4 to prevent dropouts during prone/push-up frames).
+const ARM_VISIBILITY_MIN = 0.25;
+const AUX_VISIBILITY_MIN = 0.18;
+// Time-constant (ms) for FPS-independent EMA smoothing of angles and proximity.
+const SMOOTH_TAU_MS = 60;
+// Slow decay time-constant (ms) for reference body scale so bending arms never collapses the scale denominator.
+const SCALE_DECAY_TAU_MS = 3000;
+// Default detection confidence (%) applied on startup for reliable prone/push-up tracking.
+const DEFAULT_CONFIDENCE_PCT = 35;
+// Consecutive pose.send errors tolerated before stopping the tracking loop.
+const MAX_CONSECUTIVE_ERRORS = 5;
 
 const POSE_CONNECTIONS = [
   [0, 1], [1, 2], [2, 3], [3, 7],
@@ -34,14 +51,21 @@ const POSE_CONNECTIONS = [
   [23, 25], [24, 26], [25, 27], [26, 28], [27, 29], [28, 30], [29, 31], [30, 32],
 ];
 
-const coarsePointer = typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
+const coarsePointer =
+  typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
 
 const els = {};
 const state = {
   pose: null,
   stream: null,
+  cameraOpId: 0,
+  cameraBusy: false,
   running: false,
   rafId: null,
+  optionsDirty: false,
+  consecutiveErrors: 0,
+  videoWidth: 0,
+  videoHeight: 0,
   fpsFrames: 0,
   fpsStartedAt: 0,
   lastTrackingStatus: "",
@@ -69,17 +93,27 @@ const state = {
     upSince: 0,
     lastRepAt: 0,
     invalidFrames: 0,
+    invalidSince: 0,
+    lastValidAt: 0,
+    lastHipValidAt: 0,
+    refScale: 0,
+    smoothAngle: null,
+    smoothProx: null,
     avgAngle: null,
     prox: null,
+    isDown: false,
+    isUp: false,
     mirrorOk: false,
     handsBelow: false,
     leftAngle: null,
     rightAngle: null,
     armLength: 0,
+    trackedArms: "",
   },
 };
 
 let optionsTimer = null;
+let endpointInputTimer = null;
 
 document.addEventListener("DOMContentLoaded", init);
 
@@ -87,6 +121,11 @@ async function init() {
   cacheElements();
   bindEvents();
   restoreSendSettings();
+
+  // Lower default slider from 50% to 35% so prone push-up tracking doesn't drop out on startup.
+  if (els.confidence && Number(els.confidence.value) === 50) {
+    els.confidence.value = String(DEFAULT_CONFIDENCE_PCT);
+  }
 
   setFacingMode(state.facingMode, { restart: false });
   updateConfidenceLabel();
@@ -190,9 +229,9 @@ function bindEvents() {
   els.frontCamBtn.addEventListener("click", () => setFacingMode("user"));
   els.backCamBtn.addEventListener("click", () => setFacingMode("environment"));
 
-  els.video.addEventListener("loadedmetadata", updateCanvasSize);
-  window.addEventListener("resize", updateCanvasSize);
-  window.addEventListener("orientationchange", updateCanvasSize);
+  els.video.addEventListener("loadedmetadata", () => updateCanvasSize(true));
+  window.addEventListener("resize", () => updateCanvasSize(false));
+  window.addEventListener("orientationchange", () => updateCanvasSize(true));
 
   els.video.addEventListener("play", () => {
     setTrackingStatus("Searching…", "searching");
@@ -205,7 +244,7 @@ function bindEvents() {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       stopDetection();
-    } else if (!els.video.paused) {
+    } else if (!els.video.paused && state.stream) {
       startDetection();
     }
   });
@@ -220,10 +259,22 @@ function bindEvents() {
   });
   els.mirror.addEventListener("change", applyMirrorClass);
 
-  els.sendEndpoint.addEventListener("change", saveSendSettings);
-  els.sendEnabled.addEventListener("change", saveSendSettings);
+  els.sendEndpoint.addEventListener("input", scheduleEndpointSave);
+  els.sendEndpoint.addEventListener("change", () => saveSendSettings({ strictToggle: true }));
+  els.sendEnabled.addEventListener("change", () => saveSendSettings({ strictToggle: true }));
   els.sendTestBtn.addEventListener("click", testSend);
   els.sendRetryBtn.addEventListener("click", flushPendingEvents);
+}
+
+function stopStreamTracks(stream) {
+  if (!stream) return;
+  stream.getTracks().forEach((track) => {
+    try {
+      track.stop();
+    } catch {
+      // Ignore already-stopped tracks.
+    }
+  });
 }
 
 async function openCamera() {
@@ -239,6 +290,18 @@ async function openCamera() {
     return;
   }
 
+  const opId = ++state.cameraOpId;
+  state.cameraBusy = true;
+  updateCameraButtons();
+
+  // Release any previous stream first so mobile devices can switch cameras reliably.
+  stopDetection();
+  if (state.stream) {
+    stopStreamTracks(state.stream);
+    state.stream = null;
+    els.video.srcObject = null;
+  }
+
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
@@ -249,34 +312,53 @@ async function openCamera() {
       },
     });
 
-    if (state.stream) {
-      state.stream.getTracks().forEach((track) => track.stop());
+    // Discard stream if user closed or switched camera while permission/hardware was pending.
+    if (opId !== state.cameraOpId) {
+      stopStreamTracks(stream);
+      return;
     }
+
     state.stream = stream;
     els.video.loop = false;
     els.video.srcObject = stream;
 
-    updateCanvasSize();
+    updateCanvasSize(true);
     els.videoWrap.classList.add("active");
     els.placeholder.hidden = true;
     els.hud.hidden = false;
 
     resetPushup();
-    updateCameraButtons();
     await els.video.play();
-    setMessage("Camera on. Waiting for push-up pose…", "success");
+
+    if (opId !== state.cameraOpId) {
+      stopStreamTracks(stream);
+      if (state.stream === stream) state.stream = null;
+      return;
+    }
+
+    updateCanvasSize(true);
+    startDetection();
+    setMessage("Camera on. Get into push-up pose (front, 45° angle, or side view).", "success");
   } catch (error) {
+    if (opId !== state.cameraOpId) return;
     const detail = describeCameraError(error);
-    updateCameraButtons();
     setMessage(detail, "error");
     setPlaceholder("Camera unavailable", detail);
     setPosePrompt(null);
+  } finally {
+    if (opId === state.cameraOpId) {
+      state.cameraBusy = false;
+      updateCameraButtons();
+    }
   }
 }
 
 function closeCamera() {
+  state.cameraOpId += 1;
+  state.cameraBusy = false;
+
   if (state.stream) {
-    state.stream.getTracks().forEach((track) => track.stop());
+    stopStreamTracks(state.stream);
     state.stream = null;
   }
 
@@ -298,9 +380,12 @@ function closeCamera() {
 
 function updateCameraButtons() {
   const open = Boolean(state.stream);
-  els.openCameraBtn.disabled = open;
-  els.closeCameraBtn.disabled = !open;
-  els.openCameraBtn.textContent = open ? "Camera open" : "Open camera";
+  const busy = state.cameraBusy;
+  els.openCameraBtn.disabled = open || busy;
+  els.closeCameraBtn.disabled = !open && !busy;
+  els.frontCamBtn.disabled = busy;
+  els.backCamBtn.disabled = busy;
+  els.openCameraBtn.textContent = busy ? "Starting…" : open ? "Camera open" : "Open camera";
 }
 
 function setFacingMode(mode, { restart = true } = {}) {
@@ -318,16 +403,17 @@ function setFacingMode(mode, { restart = true } = {}) {
   els.mirror.checked = front;
   applyMirrorClass();
   els.cameraHint.textContent = front
-    ? "Front camera selected. Keep the whole body in frame."
-    : "Back camera selected. Place it so the full body is visible.";
+    ? "Front camera selected. Keep head, arms and hips in frame (front, 45° angle, or side view)."
+    : "Back camera selected. Place it so head, arms and hips stay in frame (front, 45° angle, or side view).";
 
-  if (restart && changed && state.stream) openCamera();
+  if (restart && changed && (state.stream || state.cameraBusy)) openCamera();
 }
 
 function startDetection() {
-  if (state.running || !state.pose) return;
+  if (state.running || !state.pose || !state.stream) return;
 
   state.running = true;
+  state.consecutiveErrors = 0;
   state.fpsFrames = 0;
   state.fpsStartedAt = performance.now();
   detectFrame();
@@ -345,31 +431,47 @@ async function detectFrame() {
   if (!state.running) return;
 
   try {
+    if (state.optionsDirty) {
+      state.optionsDirty = false;
+      await applyPoseOptions();
+    }
+
     if (els.video.readyState >= 2 && els.video.videoWidth > 0) {
-      updateCanvasSize();
+      updateCanvasSize(false);
       await state.pose.send({ image: els.video });
     }
   } catch (error) {
-    console.error(error);
-    stopDetection();
-    setMessage(`Pose tracking stopped because of an error: ${error.message || error}`, "error");
-    return;
+    state.consecutiveErrors += 1;
+    console.warn(`Pose frame error (${state.consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}):`, error);
+
+    if (state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      stopDetection();
+      setMessage(`Pose tracking stopped because of an error: ${error.message || error}`, "error");
+      return;
+    }
   }
 
-  if (state.running) state.rafId = requestAnimationFrame(detectFrame);
+  if (state.running) {
+    state.rafId = requestAnimationFrame(detectFrame);
+  }
 }
 
 function onResults(results) {
+  // Guard against stale results arriving after camera closed or paused mid-frame.
+  if (!state.running || !state.stream) return;
+
+  state.consecutiveErrors = 0;
   updateFps();
 
   const landmarks = results.poseLandmarks;
   const hasBody = Boolean(landmarks && landmarks.length > 0);
+  const now = performance.now();
 
   if (!hasBody) {
     clearOverlay();
     els.landmarkCount.textContent = "0";
     setTrackingStatus("No body found", "searching");
-    updatePushupCounter(null, performance.now());
+    updatePushupCounter(null, now);
     return;
   }
 
@@ -383,10 +485,10 @@ function onResults(results) {
   setTrackingStatus("Body found", "found");
   storeLandmarks(landmarks);
 
-  const metrics = getPushupMetrics(landmarks);
-  updatePushupCounter(metrics, performance.now());
+  const metrics = getPushupMetrics(landmarks, now);
+  updatePushupCounter(metrics, now);
 
-  if (metrics) {
+  if (metrics && els.showSkeleton.checked) {
     drawThresholdGuides(landmarks, metrics);
   }
 }
@@ -477,7 +579,9 @@ function updateSelectAllButton() {
     state.capturedDots.every((capture) => capture.selected !== false);
 
   els.selectAllCapturesBtn.textContent = allSelected ? "Select none" : "Select all";
-  els.downloadSelectedBtn.disabled = !state.capturedDots.some((capture) => capture.selected !== false);
+  els.downloadSelectedBtn.disabled = !state.capturedDots.some(
+    (capture) => capture.selected !== false,
+  );
 }
 
 function toggleAllCaptures() {
@@ -506,7 +610,10 @@ function downloadSelectedCaptures() {
     "selected-captures",
   );
 
-  setMessage(`Downloaded ${selected.length} capture${selected.length === 1 ? "" : "s"}.`, "success");
+  setMessage(
+    `Downloaded ${selected.length} capture${selected.length === 1 ? "" : "s"}.`,
+    "success",
+  );
 }
 
 function makeSessionId() {
@@ -542,6 +649,14 @@ function normalizeSendEndpoint(value) {
   }
 }
 
+function scheduleEndpointSave() {
+  if (endpointInputTimer !== null) clearTimeout(endpointInputTimer);
+  endpointInputTimer = setTimeout(() => {
+    endpointInputTimer = null;
+    saveSendSettings({ strictToggle: false });
+  }, 250);
+}
+
 function restoreSendSettings() {
   const sender = state.sender;
   sender.sessionId = getSessionId();
@@ -561,13 +676,15 @@ function restoreSendSettings() {
   setSendReadyStatus();
 }
 
-function saveSendSettings() {
+function saveSendSettings({ strictToggle = true } = {}) {
   const endpoint = normalizeSendEndpoint(els.sendEndpoint.value);
   const enabled = els.sendEnabled.checked && Boolean(endpoint);
 
   state.sender.endpoint = endpoint;
   state.sender.enabled = enabled;
-  if (!endpoint) els.sendEnabled.checked = false;
+  if (strictToggle && !endpoint) {
+    els.sendEnabled.checked = false;
+  }
 
   try {
     localStorage.setItem(
@@ -638,33 +755,8 @@ function buildSendEvent(event) {
 
 function sendDotEvent(event) {
   if (!isSendReady()) return;
-  void dispatchSendEvent(buildSendEvent(event));
-}
-
-async function dispatchSendEvent(event) {
-  const sender = state.sender;
-  if (sender.sending) {
-    queueSendEvent(event);
-    return;
-  }
-
-  sender.sending = true;
-  updateSendStatus(`Sending ${event.event}…`);
-
-  const ok = await postSendEvent(event);
-  if (!ok) {
-    queueSendEvent(event);
-  } else {
-    while (sender.pending.length) {
-      const next = sender.pending[0];
-      updateSendStatus(`Sending queued ${next.event}…`);
-      if (!(await postSendEvent(next))) break;
-      sender.pending.shift();
-    }
-  }
-
-  sender.sending = false;
-  updateSendStatus();
+  queueSendEvent(buildSendEvent(event));
+  void flushPendingEvents();
 }
 
 function queueSendEvent(event) {
@@ -675,7 +767,7 @@ function queueSendEvent(event) {
 }
 
 async function postSendEvent(event) {
-  if (!state.sender.endpoint) return false;
+  if (!state.sender.endpoint) return { ok: false, reason: "no server URL" };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
@@ -689,13 +781,11 @@ async function postSendEvent(event) {
       keepalive: true,
     });
     if (!response.ok) throw new Error(`server returned ${response.status}`);
-    updateSendStatus(`Sent ${event.event} = 1 · ${new Date().toLocaleTimeString()}`, "success");
-    return true;
+    return { ok: true };
   } catch (error) {
     const reason = error.name === "AbortError" ? "timed out" : error.message || String(error);
-    updateSendStatus(`Send failed (${reason}). Event kept for retry.`, "error");
     console.warn("PoseTrack send failed:", error);
-    return false;
+    return { ok: false, reason };
   } finally {
     clearTimeout(timer);
   }
@@ -707,13 +797,24 @@ async function flushPendingEvents() {
 
   sender.sending = true;
   updateSendStatus();
-  while (sender.pending.length) {
-    const next = sender.pending[0];
-    if (!(await postSendEvent(next))) break;
-    sender.pending.shift();
+
+  try {
+    // Strictly drain in FIFO order so server always receives push_down before push_up.
+    while (sender.pending.length && isSendReady()) {
+      const next = sender.pending[0];
+      updateSendStatus(`Sending ${next.event}…`);
+      const result = await postSendEvent(next);
+      if (!result.ok) {
+        updateSendStatus(`Send failed (${result.reason}). Event kept for retry.`, "error");
+        break;
+      }
+      sender.pending.shift();
+      updateSendStatus(`Sent ${next.event} = 1 · ${new Date().toLocaleTimeString()}`, "success");
+    }
+  } finally {
+    sender.sending = false;
+    updateSendStatus();
   }
-  sender.sending = false;
-  updateSendStatus();
 }
 
 function testSend() {
@@ -727,8 +828,9 @@ function testSend() {
   state.sender.endpoint = endpoint;
   state.sender.enabled = true;
   els.sendEnabled.checked = true;
-  saveSendSettings();
-  void dispatchSendEvent(buildSendEvent("test"));
+  saveSendSettings({ strictToggle: true });
+  queueSendEvent(buildSendEvent("test"));
+  void flushPendingEvents();
   setMessage("Test event sent. Check the send status below.", "info");
 }
 
@@ -747,7 +849,8 @@ function updateSendStatus(text, kind = "idle") {
   const sender = state.sender;
   if (text) sender.status = { text, kind };
 
-  els.sendStatus.textContent = sender.status.text;
+  const queuedSuffix = sender.pending.length ? ` (${sender.pending.length} queued)` : "";
+  els.sendStatus.textContent = `${sender.status.text}${queuedSuffix}`;
   els.sendStatus.dataset.kind = sender.status.kind;
   els.sendRetryBtn.disabled = !sender.pending.length || sender.sending || !isSendReady();
 }
@@ -800,29 +903,64 @@ function drawSkeleton(landmarks) {
   ctx.globalAlpha = 1;
 }
 
+function getHeadAnchor(landmarks) {
+  const earL = landmarks[7];
+  const earR = landmarks[8];
+  const nose = landmarks[0];
+  const earLValid = isVisible(earL, AUX_VISIBILITY_MIN);
+  const earRValid = isVisible(earR, AUX_VISIBILITY_MIN);
+
+  if (earLValid && earRValid) return midpoint(earL, earR);
+  if (earLValid) return earL;
+  if (earRValid) return earR;
+  if (isVisible(nose, AUX_VISIBILITY_MIN)) return nose;
+  return null;
+}
+
 function drawThresholdGuides(landmarks, metrics) {
   const ctx = els.overlay.getContext("2d");
   const width = els.overlay.width;
   const height = els.overlay.height;
+  const pushup = state.pushup;
 
-  const earL = landmarks[7];
-  const earR = landmarks[8];
-  const ear = earL && earR ? midpoint(earL, earR) : earL || earR || landmarks[0];
+  const head = getHeadAnchor(landmarks);
+  const displayProx =
+    metrics.inPushupPose && pushup.prox != null ? pushup.prox : metrics.prox;
 
-  const angleColor = (a) =>
-    a <= DOWN_ANGLE_MAX ? "#a3e635" : a >= UP_ANGLE_MIN ? "#22d3ee" : "#fbbf24";
-  const proxColor =
-    metrics.prox != null && metrics.prox <= PROX_DOWN_MAX ? "#a3e635"
-      : metrics.prox != null && metrics.prox >= PROX_UP_MIN ? "#22d3ee"
-      : "#fbbf24";
+  const angleColor = (a) => {
+    if (!metrics.inPushupPose) return "#94a3b8";
+    if (pushup.isDown || a <= DOWN_ANGLE_MAX) return "#a3e635";
+    if (pushup.isUp || a >= UP_ANGLE_MIN) return "#22d3ee";
+    return "#fbbf24";
+  };
+
+  const proxColor = !metrics.inPushupPose
+    ? "#94a3b8"
+    : pushup.isDown || (displayProx != null && displayProx <= PROX_DOWN_MAX)
+      ? "#a3e635"
+      : pushup.isUp || (displayProx != null && displayProx >= PROX_UP_MIN)
+        ? "#22d3ee"
+        : "#fbbf24";
 
   const arms = [
-    { shoulder: landmarks[11], elbow: landmarks[13], wrist: landmarks[15], angle: metrics.leftAngle, label: "L" },
-    { shoulder: landmarks[12], elbow: landmarks[14], wrist: landmarks[16], angle: metrics.rightAngle, label: "R" },
+    {
+      shoulder: landmarks[11],
+      elbow: landmarks[13],
+      wrist: landmarks[15],
+      angle: metrics.leftAngle,
+      label: "L",
+    },
+    {
+      shoulder: landmarks[12],
+      elbow: landmarks[14],
+      wrist: landmarks[16],
+      angle: metrics.rightAngle,
+      label: "R",
+    },
   ];
 
   for (const arm of arms) {
-    if (!arm.shoulder || !arm.elbow || !arm.wrist) continue;
+    if (arm.angle == null || !arm.shoulder || !arm.elbow || !arm.wrist) continue;
 
     const sx = arm.shoulder.x * width;
     const sy = arm.shoulder.y * height;
@@ -832,15 +970,15 @@ function drawThresholdGuides(landmarks, metrics) {
     const wy = arm.wrist.y * height;
     const color = angleColor(arm.angle);
 
-    // Ear → wrist proximity line.
-    if (ear) {
+    // Head → wrist proximity line.
+    if (head) {
       ctx.save();
       ctx.globalAlpha = 0.5;
       ctx.strokeStyle = proxColor;
       ctx.lineWidth = Math.max(2, width * 0.0025);
       ctx.setLineDash([Math.max(5, width * 0.005), Math.max(4, width * 0.004)]);
       ctx.beginPath();
-      ctx.moveTo(ear.x * width, ear.y * height);
+      ctx.moveTo(head.x * width, head.y * height);
       ctx.lineTo(wx, wy);
       ctx.stroke();
       ctx.restore();
@@ -881,13 +1019,20 @@ function drawThresholdGuides(landmarks, metrics) {
     );
   }
 
-  // Proximity + mirror readout near the ear.
-  if (ear) {
+  // Proximity + tracking mode readout near the head.
+  if (head) {
+    const modeTag =
+      metrics.trackedArms === "L+R"
+        ? metrics.mirrorOk
+          ? "L+R ✓"
+          : "L+R –"
+        : `${metrics.trackedArms} 1-arm`;
+    const poseTag = metrics.inPushupPose ? modeTag : "not in pose";
     drawReadableText(
       ctx,
-      `prox ${metrics.prox != null ? metrics.prox.toFixed(2) : "--"} · ${metrics.mirrorOk ? "mirror ✓" : "mirror –"}`,
-      ear.x * width,
-      ear.y * height - Math.max(12, width * 0.014),
+      `prox ${displayProx != null ? displayProx.toFixed(2) : "--"} · ${poseTag}`,
+      head.x * width,
+      head.y * height - Math.max(12, width * 0.014),
       width,
       proxColor,
       0.8,
@@ -921,9 +1066,16 @@ function clearOverlay() {
   if (ctx) ctx.clearRect(0, 0, els.overlay.width, els.overlay.height);
 }
 
-function updateCanvasSize() {
+function updateCanvasSize(force = false) {
   const width = els.video.videoWidth || 1280;
   const height = els.video.videoHeight || 720;
+
+  if (!force && width === state.videoWidth && height === state.videoHeight) {
+    return;
+  }
+
+  state.videoWidth = width;
+  state.videoHeight = height;
 
   if (width && height) {
     els.stage.style.aspectRatio = `${width} / ${height}`;
@@ -948,22 +1100,35 @@ function updateFps() {
   }
 }
 
-function resetPushup() {
+function resetPushupState(count = 0) {
   const pushup = state.pushup;
   pushup.phase = "counting";
-  pushup.count = 0;
+  pushup.count = count;
   pushup.armed = false;
   pushup.downSince = 0;
   pushup.upSince = 0;
-  pushup.lastRepAt = performance.now();
+  pushup.lastRepAt = 0;
   pushup.invalidFrames = 0;
+  pushup.invalidSince = 0;
+  pushup.lastValidAt = 0;
+  pushup.lastHipValidAt = 0;
+  pushup.refScale = 0;
+  pushup.smoothAngle = null;
+  pushup.smoothProx = null;
   pushup.avgAngle = null;
   pushup.prox = null;
+  pushup.isDown = false;
+  pushup.isUp = false;
   pushup.mirrorOk = false;
   pushup.handsBelow = false;
   pushup.leftAngle = null;
   pushup.rightAngle = null;
   pushup.armLength = 0;
+  pushup.trackedArms = "";
+}
+
+function resetPushup() {
+  resetPushupState(0);
 
   state.lastLandmarks = [];
   state.landmarkHistory = [];
@@ -972,9 +1137,13 @@ function resetPushup() {
 
   updateCounterUI();
   els.armValues.textContent =
-    `DOWN ≤${DOWN_ANGLE_MAX}° · UP ≥${UP_ANGLE_MIN}° · prox ${PROX_DOWN_MAX}/${PROX_UP_MIN}`;
+    `DOWN ≤${DOWN_ANGLE_MAX}° · UP ≥${UP_ANGLE_MIN}° · prox ≤${PROX_DOWN_MAX} / ≥${PROX_UP_MIN}`;
   setPosePrompt(null);
   setCounterStatus("Get into push-up pose and start counting.", "idle");
+}
+
+function formatAngle(value) {
+  return value != null ? `${Math.round(value)}°` : "--";
 }
 
 function updatePushupCounter(metrics, now) {
@@ -982,47 +1151,89 @@ function updatePushupCounter(metrics, now) {
 
   if (pushup.phase !== "counting") return;
 
-  // Grace period: keep the current rep state through brief dropouts instead
-  // of wiping it on a single bad frame.
+  // Time-based grace period: preserve armed rep state through brief occlusions/dropouts.
   if (!metrics || !metrics.inPushupPose) {
     pushup.invalidFrames += 1;
-    if (pushup.invalidFrames > GRACE_FRAMES) {
+    pushup.isDown = false;
+    pushup.isUp = false;
+    if (!pushup.invalidSince) pushup.invalidSince = now;
+
+    if (now - pushup.invalidSince > GRACE_MS) {
       pushup.armed = false;
       pushup.downSince = 0;
       pushup.upSince = 0;
+      pushup.refScale = 0;
+      pushup.smoothAngle = null;
+      pushup.smoothProx = null;
       pushup.avgAngle = null;
       pushup.prox = null;
       pushup.leftAngle = null;
       pushup.rightAngle = null;
-      els.armValues.textContent = "Waiting for push-up pose…";
-      setCounterStatus("Waiting for push-up pose — keep hands, arms and hips in view.", "warn");
+      pushup.trackedArms = "";
+
+      if (metrics && metrics.reason) {
+        els.armValues.textContent =
+          `Elbow ${formatAngle(metrics.leftAngle)}/${formatAngle(metrics.rightAngle)} · prox ${metrics.prox.toFixed(2)}`;
+        setCounterStatus(metrics.reason, "warn");
+      } else {
+        els.armValues.textContent = "Waiting for push-up pose…";
+        setCounterStatus("Waiting for push-up pose — keep head, arms and hips in view.", "warn");
+      }
     }
     return;
   }
 
+  const dt = pushup.lastValidAt ? Math.min(250, Math.max(1, now - pushup.lastValidAt)) : 33;
+  pushup.lastValidAt = now;
   pushup.invalidFrames = 0;
+  pushup.invalidSince = 0;
+
+  // FPS-independent EMA smoothing to filter landmark jitter without lagging on slower mobile cameras.
+  const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_MS);
+  pushup.smoothAngle =
+    pushup.smoothAngle == null
+      ? metrics.avgAngle
+      : pushup.smoothAngle + alpha * (metrics.avgAngle - pushup.smoothAngle);
+  pushup.smoothProx =
+    pushup.smoothProx == null
+      ? metrics.prox
+      : pushup.smoothProx + alpha * (metrics.prox - pushup.smoothProx);
+
+  const avgAngle = pushup.smoothAngle;
+  const prox = pushup.smoothProx;
+
   pushup.armLength = metrics.armLength;
   pushup.leftAngle = metrics.leftAngle;
   pushup.rightAngle = metrics.rightAngle;
-  pushup.avgAngle = metrics.avgAngle;
-  pushup.prox = metrics.prox;
+  pushup.avgAngle = avgAngle;
+  pushup.prox = prox;
   pushup.mirrorOk = metrics.mirrorOk;
   pushup.handsBelow = metrics.handsBelow;
+  pushup.trackedArms = metrics.trackedArms;
 
+  // Mutually exclusive DOWN and UP conditions with clean hysteresis:
+  // - Standard push-up: bent elbows + lowered body
+  // - Unambiguous elbow bend (side / 45° / 70%-depth push-ups): elbow <= 118°
+  // - Tucked-elbow front push-up: clear prox drop <= 0.92 + moderate 2D bend <= 145°
   const down =
-    metrics.avgAngle <= DOWN_ANGLE_MAX &&
-    metrics.prox <= PROX_DOWN_MAX &&
     metrics.mirrorOk &&
-    metrics.handsBelow;
+    metrics.handsBelow &&
+    ((avgAngle <= DOWN_ANGLE_MAX && prox <= PROX_DOWN_MAX) ||
+      avgAngle <= DEEP_BEND_ANGLE_MAX ||
+      (prox <= 0.92 && avgAngle <= 145));
+
   const up =
-    metrics.avgAngle >= UP_ANGLE_MIN &&
-    metrics.prox >= PROX_UP_MIN &&
     metrics.mirrorOk &&
-    metrics.handsBelow;
+    metrics.handsBelow &&
+    ((avgAngle >= UP_ANGLE_MIN && prox >= PROX_UP_MIN) ||
+      (avgAngle >= 162 && prox >= 1.0));
+
+  pushup.isDown = down;
+  pushup.isUp = up;
 
   els.armValues.textContent =
-    `Elbow ${Math.round(metrics.leftAngle)}°/${Math.round(metrics.rightAngle)}° (avg ${Math.round(metrics.avgAngle)}°) · ` +
-    `prox ${metrics.prox.toFixed(2)} · ${pushup.armed ? "armed ✓" : "armed –"}`;
+    `Elbow ${formatAngle(metrics.leftAngle)}/${formatAngle(metrics.rightAngle)} (avg ${Math.round(avgAngle)}°) · ` +
+    `prox ${prox.toFixed(2)} · ${metrics.trackedArms} · ${pushup.armed ? "armed ✓" : "armed –"}`;
 
   // Arm the rep at the bottom.
   if (down) {
@@ -1058,74 +1269,200 @@ function updatePushupCounter(metrics, now) {
   }
 
   if (down) {
-    setCounterStatus(pushup.armed ? "Bottom held. Push back up." : "Hold the bottom to arm the rep.", "good");
+    setCounterStatus(
+      pushup.armed ? "Bottom held. Push back up." : "Hold the bottom to arm the rep.",
+      "good",
+    );
   } else if (up && pushup.armed) {
     setCounterStatus("Hold the top to finish the rep.", "good");
   } else if (pushup.armed) {
     setCounterStatus("Armed — push up to the top.", "good");
-  } else if (!metrics.handsBelow) {
-    setCounterStatus("Hands must be below hips in the frame.", "warn");
   } else if (!metrics.mirrorOk) {
-    setCounterStatus("Arms not mirroring — check your stance.", "warn");
+    setCounterStatus("Arms uneven — keep both elbows bending together.", "warn");
+  } else if (pushup.count > 0 && pushup.lastRepAt > 0 && now - pushup.lastRepAt < REP_STATUS_HOLD_MS) {
+    const reps = pushup.count;
+    setCounterStatus(`${reps} rep${reps === 1 ? "" : "s"} counted. Go down again!`, "good");
   } else {
     setCounterStatus("Go down (bend elbows) then up (straighten).", "idle");
   }
 }
 
-function getPushupMetrics(landmarks) {
-  const earL = landmarks[7];
-  const earR = landmarks[8];
-  const leftShoulder = landmarks[11];
-  const rightShoulder = landmarks[12];
-  const leftElbow = landmarks[13];
-  const rightElbow = landmarks[14];
-  const leftWrist = landmarks[15];
-  const rightWrist = landmarks[16];
-  const leftHip = landmarks[23];
-  const rightHip = landmarks[24];
+function getPushupMetrics(landmarks, now) {
+  const width = els.overlay.width || els.video.videoWidth || 1280;
+  const height = els.overlay.height || els.video.videoHeight || 720;
+  const minDim = Math.min(width, height);
+  const maxDim = Math.max(width, height);
 
-  const needed = [
-    earL, earR, leftShoulder, rightShoulder, leftElbow, rightElbow,
-    leftWrist, rightWrist, leftHip, rightHip,
-  ];
-  if (!needed.every(isVisible)) return null;
+  const headRaw = getHeadAnchor(landmarks);
+  if (!headRaw) return null;
+  const head = toPixelPoint(headRaw, width, height);
 
-  const shoulder = midpoint(leftShoulder, rightShoulder);
-  const hip = midpoint(leftHip, rightHip);
-  const ear = midpoint(earL, earR);
+  const lShoulderRaw = landmarks[11];
+  const rShoulderRaw = landmarks[12];
+  const lElbowRaw = landmarks[13];
+  const rElbowRaw = landmarks[14];
+  const lWristRaw = landmarks[15];
+  const rWristRaw = landmarks[16];
 
-  const leftArmLength = distance(leftShoulder, leftElbow) + distance(leftElbow, leftWrist);
-  const rightArmLength = distance(rightShoulder, rightElbow) + distance(rightElbow, rightWrist);
-  if (leftArmLength < 0.02 || rightArmLength < 0.02) return null;
+  const leftArmValid =
+    isVisible(lShoulderRaw, ARM_VISIBILITY_MIN) &&
+    isVisible(lElbowRaw, ARM_VISIBILITY_MIN) &&
+    isVisible(lWristRaw, ARM_VISIBILITY_MIN);
+  const rightArmValid =
+    isVisible(rShoulderRaw, ARM_VISIBILITY_MIN) &&
+    isVisible(rElbowRaw, ARM_VISIBILITY_MIN) &&
+    isVisible(rWristRaw, ARM_VISIBILITY_MIN);
 
-  const armLength = (leftArmLength + rightArmLength) / 2;
-  const shoulderWidth = distance(leftShoulder, rightShoulder);
-  if (shoulderWidth < 0.02) return null;
+  if (!leftArmValid && !rightArmValid) return null;
 
-  const leftAngle = jointAngle(leftShoulder, leftElbow, leftWrist);
-  const rightAngle = jointAngle(rightShoulder, rightElbow, rightWrist);
-  const avgAngle = (leftAngle + rightAngle) / 2;
-  const prox = (distance(leftWrist, ear) + distance(rightWrist, ear)) / (2 * shoulderWidth);
-  const mirrorOk = Math.abs(leftAngle - rightAngle) <= MIRROR_MAX_DIFF;
-  const handsBelow = ((leftWrist.y - hip.y) + (rightWrist.y - hip.y)) / 2 > HANDS_BELOW_HIP_MIN;
+  const lShoulder = leftArmValid ? toPixelPoint(lShoulderRaw, width, height) : null;
+  const lElbow = leftArmValid ? toPixelPoint(lElbowRaw, width, height) : null;
+  const lWrist = leftArmValid ? toPixelPoint(lWristRaw, width, height) : null;
 
-  const headLevel = Math.abs(ear.y - shoulder.y) < 0.18;
-  const hipLevel = Math.abs(hip.y - shoulder.y) < 0.38;
+  const rShoulder = rightArmValid ? toPixelPoint(rShoulderRaw, width, height) : null;
+  const rElbow = rightArmValid ? toPixelPoint(rElbowRaw, width, height) : null;
+  const rWrist = rightArmValid ? toPixelPoint(rWristRaw, width, height) : null;
+
+  const leftArmLengthPx = leftArmValid
+    ? distance(lShoulder, lElbow) + distance(lElbow, lWrist)
+    : 0;
+  const rightArmLengthPx = rightArmValid
+    ? distance(rShoulder, rElbow) + distance(rElbow, rWrist)
+    : 0;
+
+  const minArmPx = minDim * 0.04;
+  const useLeft = leftArmValid && leftArmLengthPx >= minArmPx;
+  const useRight = rightArmValid && rightArmLengthPx >= minArmPx;
+  if (!useLeft && !useRight) return null;
+
+  const armLengthPx =
+    useLeft && useRight
+      ? (leftArmLengthPx + rightArmLengthPx) / 2
+      : useLeft
+        ? leftArmLengthPx
+        : rightArmLengthPx;
+
+  const shoulderWidthPx =
+    useLeft && useRight ? distance(lShoulder, rShoulder) : 0;
+
+  const shoulder =
+    useLeft && useRight ? midpoint(lShoulder, rShoulder) : useLeft ? lShoulder : rShoulder;
+
+  // Check hips early so torso length can stabilize body scale in side view.
+  const lHipRaw = landmarks[23];
+  const rHipRaw = landmarks[24];
+  const lHipValid = isVisible(lHipRaw, AUX_VISIBILITY_MIN);
+  const rHipValid = isVisible(rHipRaw, AUX_VISIBILITY_MIN);
+  const lHip = lHipValid ? toPixelPoint(lHipRaw, width, height) : null;
+  const rHip = rHipValid ? toPixelPoint(rHipRaw, width, height) : null;
+  const hip = lHip && rHip ? midpoint(lHip, rHip) : lHip || rHip;
+
+  const torsoLengthPx = hip ? distance(shoulder, hip) : 0;
+
+  // Stable body scale across front view (shoulderWidth), side view (torsoLength), and angled view (armLength).
+  const baseScale = Math.max(shoulderWidthPx, torsoLengthPx * 0.85, armLengthPx * 0.72);
+  if (baseScale < 12) return null;
+
+  const pushup = state.pushup;
+  // Use bounded preview scale for posture checks so standing close never pollutes refScale.
+  const previewScale = pushup.refScale
+    ? Math.min(baseScale * 1.45, Math.max(baseScale, pushup.refScale * 0.9))
+    : baseScale;
+
+  const leftAngle = useLeft ? jointAngle(lShoulder, lElbow, lWrist) : null;
+  const rightAngle = useRight ? jointAngle(rShoulder, rElbow, rWrist) : null;
+  const avgAngle =
+    useLeft && useRight ? (leftAngle + rightAngle) / 2 : useLeft ? leftAngle : rightAngle;
+
+  const headToWristPx =
+    useLeft && useRight
+      ? (distance(lWrist, head) + distance(rWrist, head)) / 2
+      : useLeft
+        ? distance(lWrist, head)
+        : distance(rWrist, head);
+
+  const mirrorOk =
+    useLeft && useRight ? Math.abs(leftAngle - rightAngle) <= MIRROR_MAX_DIFF : true;
+
+  const wristY = useLeft && useRight ? (lWrist.y + rWrist.y) / 2 : useLeft ? lWrist.y : rWrist.y;
+  const handsNotOverhead = (wristY - shoulder.y) / previewScale >= -0.20;
+  const headLevel = Math.abs(head.y - shoulder.y) / previewScale < 0.85;
+
+  let handsBelow = false;
+  let inPushupPose = false;
+  let reason = "";
+
+  if (hip) {
+    const torsoVerticalRatio = (hip.y - shoulder.y) / previewScale;
+    const notStanding = torsoVerticalRatio < MAX_TORSO_VERTICAL_RATIO;
+    handsBelow = (wristY - hip.y) / previewScale >= HANDS_BELOW_HIP_MIN;
+
+    if (!notStanding) {
+      reason = "Standing detected — get down into push-up pose.";
+    } else if (!handsBelow || !handsNotOverhead) {
+      reason = "Place hands on the floor below shoulder/hip level.";
+    } else if (!headLevel) {
+      reason = "Keep your head aligned with your shoulders.";
+    } else {
+      inPushupPose = true;
+      pushup.lastHipValidAt = now;
+    }
+  } else {
+    // Hips temporarily occluded (common at bottom of front-view push-up): keep tracking briefly.
+    const recentlyValid =
+      pushup.armed ||
+      (pushup.lastHipValidAt > 0 && now - pushup.lastHipValidAt <= HIP_OCCLUSION_MEMORY_MS);
+
+    if (recentlyValid && handsNotOverhead && headLevel) {
+      handsBelow = true;
+      inPushupPose = true;
+    } else {
+      reason = "Step back slightly so your hips are visible in the frame.";
+    }
+  }
+
+  // Only update refScale while in a valid push-up pose so standing/walking frames never skew scale.
+  let scale = previewScale;
+  if (inPushupPose) {
+    const dt = pushup.lastValidAt ? Math.min(250, Math.max(1, now - pushup.lastValidAt)) : 33;
+    if (!pushup.refScale) {
+      pushup.refScale = baseScale;
+    } else if (baseScale > pushup.refScale) {
+      pushup.refScale = pushup.refScale * 0.65 + baseScale * 0.35;
+    } else {
+      const decay = 1 - Math.exp(-dt / SCALE_DECAY_TAU_MS);
+      pushup.refScale += decay * (baseScale - pushup.refScale);
+    }
+    scale = Math.min(baseScale * 1.45, Math.max(baseScale, pushup.refScale * 0.9));
+  }
+
+  const prox = headToWristPx / scale;
 
   return {
-    inPushupPose: headLevel && hipLevel && handsBelow,
-    armLength,
+    inPushupPose,
+    reason,
+    armLength: armLengthPx / maxDim,
     leftAngle,
     rightAngle,
     avgAngle,
     prox,
     mirrorOk,
     handsBelow,
+    trackedArms: useLeft && useRight ? "L+R" : useLeft ? "L" : "R",
   };
 }
 
-function isVisible(point) {
-  return Boolean(point && (point.visibility ?? 1) >= 0.4);
+function isVisible(point, minVisibility = ARM_VISIBILITY_MIN) {
+  return Boolean(point && (point.visibility ?? 1) >= minVisibility);
+}
+
+function toPixelPoint(point, width, height) {
+  return {
+    x: point.x * width,
+    y: point.y * height,
+    z: (point.z ?? 0) * width,
+    visibility: point.visibility ?? 1,
+  };
 }
 
 function midpoint(a, b) {
@@ -1257,25 +1594,13 @@ function applyImportedData(data) {
     throw new Error("This is not a PoseTrack export file.");
   }
 
-  const pushup = state.pushup;
-
-  // Thresholds are fixed constants now, so there is nothing to restore
-  // from old calibration data. Just reset to counting mode.
-  pushup.phase = "counting";
-  pushup.armed = false;
-  pushup.downSince = 0;
-  pushup.upSince = 0;
-  pushup.invalidFrames = 0;
-  pushup.lastRepAt = performance.now();
-
-  if (Number.isFinite(data.counter?.count)) {
-    pushup.count = Math.max(0, data.counter.count);
-  } else {
-    pushup.count = 0;
-  }
+  const importedCount = Number.isFinite(data.counter?.count)
+    ? Math.max(0, data.counter.count)
+    : 0;
+  resetPushupState(importedCount);
 
   els.armValues.textContent =
-    `DOWN ≤${DOWN_ANGLE_MAX}° · UP ≥${UP_ANGLE_MIN}° · prox ${PROX_DOWN_MAX}/${PROX_UP_MIN}`;
+    `DOWN ≤${DOWN_ANGLE_MAX}° · UP ≥${UP_ANGLE_MIN}° · prox ≤${PROX_DOWN_MAX} / ≥${PROX_UP_MIN}`;
   setPosePrompt(null);
   setCounterStatus("Imported. Start push-ups!", "good");
 
@@ -1287,7 +1612,8 @@ function applyImportedData(data) {
     ? data.capturedDots
         .map((capture, index) => ({
           id: Number.isFinite(capture?.id) ? capture.id : index + 1,
-          capturedAt: typeof capture?.capturedAt === "string" ? capture.capturedAt : new Date().toISOString(),
+          capturedAt:
+            typeof capture?.capturedAt === "string" ? capture.capturedAt : new Date().toISOString(),
           frame: Number.isFinite(capture?.frame) ? capture.frame : 0,
           points: cleanFrame(capture?.points),
           selected: typeof capture?.selected === "boolean" ? capture.selected : true,
@@ -1331,21 +1657,31 @@ function schedulePoseOptions() {
   if (optionsTimer !== null) clearTimeout(optionsTimer);
   optionsTimer = setTimeout(() => {
     optionsTimer = null;
-    applyPoseOptions().catch((error) => {
-      setMessage(`Could not update tracker settings: ${error.message || error}`, "error");
-    });
+    if (state.running) {
+      // Defer into detectFrame so setOptions never collides with an in-flight pose.send.
+      state.optionsDirty = true;
+    } else {
+      applyPoseOptions().catch((error) => {
+        setMessage(`Could not update tracker settings: ${error.message || error}`, "error");
+      });
+    }
   }, 160);
 }
 
 async function applyPoseOptions() {
   if (!state.pose) return;
 
-  const confidence = Number(els.confidence.value) / 100;
+  const confidence = Math.min(
+    0.95,
+    Math.max(0.1, (Number(els.confidence.value) || DEFAULT_CONFIDENCE_PCT) / 100),
+  );
+  // Use Full model (1) even on mobile for reliable prone/push-up tracking,
+  // and keep tracking confidence lower than detection to avoid mid-rep dropouts.
   await state.pose.setOptions({
-    modelComplexity: state.isMobile ? 0 : 1,
+    modelComplexity: 1,
     smoothLandmarks: els.smooth.checked,
     minDetectionConfidence: confidence,
-    minTrackingConfidence: confidence,
+    minTrackingConfidence: Math.max(0.2, Math.round(confidence * 65) / 100),
   });
 }
 

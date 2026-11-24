@@ -7,6 +7,8 @@ A static, client-side automatic push-up counter.
 Camera access requires `https` or `localhost`. From this folder:
 
 ```bash
+git clone https://github.com/EsYenSuki/Witpern.git Witpern
+cd Witpern
 python3 -m http.server 8000
 ```
 

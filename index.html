@@ -16,8 +16,8 @@
         </div>
         <h1>Push-up counter</h1>
         <p>
-          The camera starts automatically. Keep your head, shoulders, arms, elbows, wrists and hips in view,
-          GO DOWN and hold for 5 seconds, then GO UP and hold for 5 seconds. Your own two poses set the counting thresholds.
+          The camera starts automatically. Keep your head, shoulders, arms, elbows, wrists and hips in view.
+          Go down (bend elbows) then push up (straighten arms) — reps are counted automatically using fixed angle and proximity thresholds.
         </p>
       </header>
 
@@ -62,7 +62,7 @@
               <button class="mode-btn" id="backCamBtn" type="button" data-facing="environment" aria-pressed="false">Back</button>
             </div>
           </div>
-          <p class="hint" id="cameraHint">Camera starts on load. Follow the DOWN then UP message on the video.</p>
+          <p class="hint" id="cameraHint">Camera starts on load. Go down and up — reps count automatically.</p>
         </div>
 
         <aside class="panel">
@@ -70,7 +70,7 @@
             <h2>Tracking</h2>
             <span class="badge">33 landmarks</span>
           </div>
-          <p class="muted">Elbow angles, hand circles, and shoulder tracking are drawn live on the video overlay.</p>
+          <p class="muted">Elbow angles and wrist-to-ear proximity are drawn live on the video overlay.</p>
 
           <div class="control">
             <label for="confidence">
@@ -93,10 +93,6 @@
               <input id="mirror" type="checkbox" checked />
               <span>Mirror video</span>
             </label>
-            <label class="toggle">
-              <input id="skipCalibration" type="checkbox" />
-              <span>Disable calibration</span>
-            </label>
           </div>
 
           <div class="counter-card">
@@ -104,7 +100,7 @@
               <div>
                 <h3>Push-up counter</h3>
                 <p class="counter-status" id="counterStatus" data-kind="idle">
-                  Get into push-up pose, then GO DOWN and hold.
+                  Get into push-up pose and start counting.
                 </p>
               </div>
               <strong id="repCount">0</strong>
@@ -112,11 +108,12 @@
             <div
               class="calibration-track"
               id="calibrationTrack"
+              hidden
               role="progressbar"
-              aria-label="Calibration progress"
+              aria-label="Ready indicator"
               aria-valuemin="0"
               aria-valuemax="100"
-              aria-valuenow="0"
+              aria-valuenow="100"
             >
               <div class="calibration-bar" id="calibrationBar"></div>
             </div>

@@ -20,10 +20,6 @@ The camera starts automatically when the page opens. Camera controls are availab
 - **Close camera** — stops the camera track and resets the counter.
 - **Front / Back** — switches camera direction and restarts the camera if it is open.
 
-## Tracking options
-
-- **Disable calibration** — skips the DOWN/UP calibration and starts counting immediately with fixed default thresholds. Turning it back on resets the counter and returns to calibration mode.
-
 ## Raw dots, export and import
 
 In the push-up counter card:
@@ -32,13 +28,13 @@ In the push-up counter card:
 - Saved snapshots appear in a list with checkboxes. Use **Select all / Select none** and **Download selected** to download only the captures you choose.
 - **Download contents** selects other data groups the exported JSON file contains:
   - All data
-  - Calibration
+  - Calibration (fixed threshold values)
   - Reps
   - Latest dots
   - Captured dots
   - Recent dot frames
 - **Export** downloads the selected JSON file.
-- **Import** loads a previous PoseTrack JSON file. Imported calibration restores counting immediately; imported dots and snapshots are restored for further export.
+- **Import** loads a previous PoseTrack JSON file. Imported dots and snapshots are restored for further export; the rep count is restored if present.
 
 ## Sending dots to your server (ngrok)
 
@@ -52,8 +48,8 @@ The counter can post dot data to your own server while you exercise:
 
 Exactly two events are sent per push-up: `push_down` with `value: 1` when the bottom pose is
 reached, and `push_up` with `value: 1` when the top pose finishes the rep. Each event includes all
-33 dot positions, the elapsed rep count, and the saved calibration values. If a send fails, the
-event is queued and can be retried with **Retry queued**.
+33 dot positions, the elapsed rep count, and the current metrics and threshold values. If a send
+fails, the event is queued and can be retried with **Retry queued**.
 
 The collector stores events as JSON arrays in `server/data/dots-YYYY-MM-DD.json`, with the newest
 event in `server/data/latest.json`. `POST /collect` needs no login; viewing the data pages requires
@@ -61,32 +57,27 @@ the username/password from `server/.env` (see `.env.example`). See `server/READM
 
 ## How it works
 
-1. The page opens the camera automatically.
-2. Counting is enabled when head, shoulders, elbows, wrists and hips are visible, and the body is low: hip-to-shoulder distance must be under half the average shoulder-to-hand distance. This blocks standing or raised poses from counting. Feet/ankles are not used.
-3. A large message on the camera tells you **GO DOWN FIRST**. Hold the bottom position for 5 seconds.
-4. DOWN calibration saves your own:
-   - bent elbow angle
-   - shoulder-to-hand reach, measured as a fraction of arm length
-5. The message changes to **NOW GO UP**. Straighten your arms and hold for 5 seconds.
-6. UP calibration saves your own straight-arm angle and reach.
-7. The two saved poses set the counting zones for your body:
-   - angle bend zone = your calibrated DOWN angle, with a ±5° deadband
-   - threshold circle = 20% of the way from your down reach to your up reach, so the circle stays smaller and closer to the hand at the bottom pose
-8. The dashed threshold circle is drawn at each **hand**. Going down brings the shoulder inside the hand circle.
-9. While the shoulder is inside the circle, both elbows must reach `down angle − 5°` to set the **bend pass**. Moving down alone does not set it.
-10. Straightening both elbows to `down angle + 5°` sets the **angle pass**. Holding between those two values does not count.
-11. Pushing back up until both shoulders leave the circles sets the **circle pass**.
-12. When **angle pass + circle pass** are both set, **one push-up is counted** and all passes reset. A short hold and gap timer prevent accidental double counts.
+No calibration is needed. The counter uses fixed thresholds derived from sample pose data:
 
-The starting pose detection uses values measured from the sample captures in `data/`: down is detected around `145°`/`0.965` reach, and up around `155°`/`0.97` reach. Those are only starting hints; after calibration the app uses your saved values instead.
+1. The page opens the camera automatically.
+2. Counting is enabled when ears, shoulders, elbows, wrists and hips are all visible, and the body is in a push-up stance: head level with shoulders, hips level with shoulders, and both hands below the hips in the frame. This blocks standing or raised poses from counting.
+3. **Elbow angle** (shoulder–elbow–wrist) is the primary signal, averaged across both arms:
+   - **DOWN** — average angle ≤ 155°
+   - **UP** — average angle ≥ 163°
+   - The 156–162° gap is a deadband so jitter cannot flip states.
+4. **Wrist-to-ear proximity** (distance from each wrist to the ear midpoint, divided by shoulder width) is a confirmation signal:
+   - **DOWN** — proximity ≤ 1.90
+   - **UP** — proximity ≥ 1.80
+5. **Mirror check** — the left and right elbow angles must differ by no more than 70°, since the front-view camera sees both arms symmetrically.
+6. **Hands-below-hips** — both wrists must sit below the hip line in the image (average `wrist.y − hip.y > 0.03`). This replaces the old torso-ratio gate and does not reject valid push-up stances.
+7. A rep is counted when the body holds the **DOWN** pose for 100 ms (arming the rep), then returns to and holds the **UP** pose for 100 ms. A 200 ms minimum gap between reps prevents double counts.
+8. A 5-frame **grace period** keeps the current state through brief wrist dropouts instead of immediately resetting.
 
 The overlay shows:
-- dashed cyan circle at each **hand** as soon as the body is detected
-- after DOWN calibration, the circle uses your saved down reach
-- after UP calibration, the circle becomes your final threshold
-- green circle and hand dot — shoulder is inside the hand circle
-- live elbow angle label near each elbow
-- bend, angle, and circle pass state in the counter panel
+- arm bones drawn shoulder→elbow→wrist, colored by angle zone (green = down, cyan = up, amber = between)
+- elbow angle in degrees at each elbow
+- dashed line from ear midpoint to each wrist, colored by proximity zone
+- proximity value and mirror check status near the ear
 
 ## Notes
 

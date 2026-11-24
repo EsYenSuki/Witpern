@@ -1,10 +1,5 @@
 const MEDIAPIPE_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675469404";
-const CALIBRATION_MS = 1000;
-const POSE_STABLE_MS = 200;
 const HOLD_MS = 100;
-const ANGLE_TOLERANCE = 25;
-const CIRCLE_DOWN_BIAS = 0.2;
-const TORSO_TO_HAND_MAX = 0.5;
 const MIN_REP_GAP_MS = 200;
 const LANDMARK_HISTORY_LIMIT = 180;
 const LANDMARK_SAMPLE_EVERY = 3;
@@ -15,10 +10,19 @@ const SEND_TIMEOUT_MS = 8000;
 const SEND_PENDING_LIMIT = 50;
 const SEND_SETTINGS_KEY = "posetrack.send";
 
-const DEFAULT_DOWN_REACH = 0.965;
-const DEFAULT_DOWN_ANGLE = 145;
-const DEFAULT_UP_REACH = 0.97;
-const DEFAULT_UP_ANGLE = 155;
+// Fixed counting thresholds — no calibration required.
+// Elbow angle (shoulder–elbow–wrist) zones, averaged across both arms.
+const UP_ANGLE_MIN = 163;   // arms straight: avg angle >= this is the UP pose
+const DOWN_ANGLE_MAX = 155; // arms bent:   avg angle <= this is the DOWN pose
+// Wrist→ear distance / shoulder width: smaller value means the body is lower.
+const PROX_UP_MIN = 1.80;
+const PROX_DOWN_MAX = 1.90;
+// Mirror check: |leftAngle − rightAngle| must stay under this (front-view symmetry).
+const MIRROR_MAX_DIFF = 70;
+// Hands must sit below the hips in the image (blocks standing / arm-curl false positives).
+const HANDS_BELOW_HIP_MIN = 0.03;
+// Hold the last known state for this many invalid frames before resetting a rep.
+const GRACE_FRAMES = 5;
 
 const POSE_CONNECTIONS = [
   [0, 1], [1, 2], [2, 3], [3, 7],
@@ -58,32 +62,19 @@ const state = {
     status: { text: "Server URL not set.", kind: "idle" },
   },
   pushup: {
-    phase: "waiting",
+    phase: "counting",
     count: 0,
-    stanceSince: 0,
-    startedAt: 0,
-    samples: [],
-    downAngle: null,
-    upAngle: null,
-    downReach: null,
-    upReach: null,
+    armed: false,
     downSince: 0,
     upSince: 0,
-    angleThreshold: null,
-    thresholdRadius: null,
-    elbowPass: false,
-    anglePass: false,
-    circlePass: false,
-    insideSince: 0,
-    angleExitSince: 0,
-    outsideSince: 0,
     lastRepAt: 0,
+    invalidFrames: 0,
+    avgAngle: null,
+    prox: null,
+    mirrorOk: false,
+    handsBelow: false,
     leftAngle: null,
     rightAngle: null,
-    leftDist: null,
-    rightDist: null,
-    leftInside: false,
-    rightInside: false,
     armLength: 0,
   },
 };
@@ -160,7 +151,6 @@ function cacheElements() {
   els.showSkeleton = document.getElementById("showSkeleton");
   els.smooth = document.getElementById("smooth");
   els.mirror = document.getElementById("mirror");
-  els.skipCalibration = document.getElementById("skipCalibration");
   els.counterStatus = document.getElementById("counterStatus");
   els.calibrationTrack = document.getElementById("calibrationTrack");
   els.calibrationBar = document.getElementById("calibrationBar");
@@ -229,7 +219,6 @@ function bindEvents() {
     if (!els.showSkeleton.checked) clearOverlay();
   });
   els.mirror.addEventListener("change", applyMirrorClass);
-  els.skipCalibration.addEventListener("change", resetPushup);
 
   els.sendEndpoint.addEventListener("change", saveSendSettings);
   els.sendEnabled.addEventListener("change", saveSendSettings);
@@ -625,24 +614,22 @@ function buildSendEvent(event) {
     repCount: pushup.count,
     calibration: {
       phase: pushup.phase,
-      downAngle: sendableNumber(pushup.downAngle),
-      upAngle: sendableNumber(pushup.upAngle),
-      downReach: sendableNumber(pushup.downReach),
-      upReach: sendableNumber(pushup.upReach),
-      angleThreshold: sendableNumber(pushup.angleThreshold),
-      thresholdRadius: sendableNumber(pushup.thresholdRadius),
+      upAngleMin: UP_ANGLE_MIN,
+      downAngleMax: DOWN_ANGLE_MAX,
+      proxUpMin: PROX_UP_MIN,
+      proxDownMax: PROX_DOWN_MAX,
+      mirrorMaxDiff: MIRROR_MAX_DIFF,
+      handsBelowHipMin: HANDS_BELOW_HIP_MIN,
     },
     metrics: {
       leftAngle: sendableNumber(pushup.leftAngle),
       rightAngle: sendableNumber(pushup.rightAngle),
-      leftDist: sendableNumber(pushup.leftDist),
-      rightDist: sendableNumber(pushup.rightDist),
+      avgAngle: sendableNumber(pushup.avgAngle),
+      prox: sendableNumber(pushup.prox),
+      mirrorOk: pushup.mirrorOk,
+      handsBelow: pushup.handsBelow,
       armLength: sendableNumber(pushup.armLength),
-      leftInside: pushup.leftInside,
-      rightInside: pushup.rightInside,
-      elbowPass: pushup.elbowPass,
-      anglePass: pushup.anglePass,
-      circlePass: pushup.circlePass,
+      armed: pushup.armed,
     },
     dotCount: dots.length,
     dots,
@@ -817,37 +804,21 @@ function drawThresholdGuides(landmarks, metrics) {
   const ctx = els.overlay.getContext("2d");
   const width = els.overlay.width;
   const height = els.overlay.height;
-  const pushup = state.pushup;
 
-  let normalizedRadius = pushup.thresholdRadius;
-  if (normalizedRadius === null) normalizedRadius = pushup.upReach;
-  if (normalizedRadius === null) normalizedRadius = pushup.downReach;
-  if (normalizedRadius === null) {
-    normalizedRadius = (metrics.leftDist + metrics.rightDist) / 2;
-  }
+  const earL = landmarks[7];
+  const earR = landmarks[8];
+  const ear = earL && earR ? midpoint(earL, earR) : earL || earR || landmarks[0];
 
-  const radius = Math.max(
-    10,
-    Math.min(width * 0.25, normalizedRadius * metrics.armLength * width),
-  );
+  const angleColor = (a) =>
+    a <= DOWN_ANGLE_MAX ? "#a3e635" : a >= UP_ANGLE_MIN ? "#22d3ee" : "#fbbf24";
+  const proxColor =
+    metrics.prox != null && metrics.prox <= PROX_DOWN_MAX ? "#a3e635"
+      : metrics.prox != null && metrics.prox >= PROX_UP_MIN ? "#22d3ee"
+      : "#fbbf24";
 
   const arms = [
-    {
-      shoulder: landmarks[11],
-      elbow: landmarks[13],
-      wrist: landmarks[15],
-      inside: pushup.leftInside,
-      angle: metrics.leftAngle,
-      label: "L",
-    },
-    {
-      shoulder: landmarks[12],
-      elbow: landmarks[14],
-      wrist: landmarks[16],
-      inside: pushup.rightInside,
-      angle: metrics.rightAngle,
-      label: "R",
-    },
+    { shoulder: landmarks[11], elbow: landmarks[13], wrist: landmarks[15], angle: metrics.leftAngle, label: "L" },
+    { shoulder: landmarks[12], elbow: landmarks[14], wrist: landmarks[16], angle: metrics.rightAngle, label: "R" },
   ];
 
   for (const arm of arms) {
@@ -859,18 +830,23 @@ function drawThresholdGuides(landmarks, metrics) {
     const ey = arm.elbow.y * height;
     const wx = arm.wrist.x * width;
     const wy = arm.wrist.y * height;
-    const color = arm.inside ? "#a3e635" : "#22d3ee";
+    const color = angleColor(arm.angle);
 
-    ctx.save();
-    ctx.globalAlpha = 0.9;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = Math.max(2, width * 0.003);
-    ctx.setLineDash([Math.max(5, width * 0.006), Math.max(4, width * 0.005)]);
-    ctx.beginPath();
-    ctx.arc(wx, wy, radius, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
+    // Ear → wrist proximity line.
+    if (ear) {
+      ctx.save();
+      ctx.globalAlpha = 0.5;
+      ctx.strokeStyle = proxColor;
+      ctx.lineWidth = Math.max(2, width * 0.0025);
+      ctx.setLineDash([Math.max(5, width * 0.005), Math.max(4, width * 0.004)]);
+      ctx.beginPath();
+      ctx.moveTo(ear.x * width, ear.y * height);
+      ctx.lineTo(wx, wy);
+      ctx.stroke();
+      ctx.restore();
+    }
 
+    // Arm bones: shoulder→elbow (bright), elbow→wrist (dim).
     ctx.globalAlpha = 0.95;
     ctx.strokeStyle = color;
     ctx.lineWidth = Math.max(2, width * 0.003);
@@ -879,7 +855,7 @@ function drawThresholdGuides(landmarks, metrics) {
     ctx.lineTo(ex, ey);
     ctx.stroke();
 
-    ctx.globalAlpha = 0.35;
+    ctx.globalAlpha = 0.5;
     ctx.beginPath();
     ctx.moveTo(ex, ey);
     ctx.lineTo(wx, wy);
@@ -894,13 +870,34 @@ function drawThresholdGuides(landmarks, metrics) {
     ctx.arc(wx, wy, Math.max(3, width * 0.005), 0, Math.PI * 2);
     ctx.fill();
 
-    drawReadableText(ctx, `${arm.label} ${Math.round(arm.angle)}°`, ex, ey - 12, width, color);
+    drawReadableText(
+      ctx,
+      `${arm.label} ${Math.round(arm.angle)}°`,
+      ex,
+      ey - Math.max(10, width * 0.012),
+      width,
+      color,
+      0.9,
+    );
+  }
+
+  // Proximity + mirror readout near the ear.
+  if (ear) {
+    drawReadableText(
+      ctx,
+      `prox ${metrics.prox != null ? metrics.prox.toFixed(2) : "--"} · ${metrics.mirrorOk ? "mirror ✓" : "mirror –"}`,
+      ear.x * width,
+      ear.y * height - Math.max(12, width * 0.014),
+      width,
+      proxColor,
+      0.8,
+    );
   }
 }
 
-function drawReadableText(ctx, text, x, y, width, color) {
+function drawReadableText(ctx, text, x, y, width, color, scale = 1) {
   ctx.save();
-  ctx.font = `700 ${Math.max(11, width * 0.013)}px Inter, system-ui, sans-serif`;
+  ctx.font = `700 ${Math.max(10, width * 0.013 * scale)}px Inter, system-ui, sans-serif`;
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
   ctx.lineWidth = Math.max(2, width * 0.002);
@@ -953,32 +950,19 @@ function updateFps() {
 
 function resetPushup() {
   const pushup = state.pushup;
-  pushup.phase = "waiting_down";
+  pushup.phase = "counting";
   pushup.count = 0;
-  pushup.stanceSince = 0;
-  pushup.startedAt = 0;
-  pushup.samples = [];
-  pushup.downAngle = null;
-  pushup.upAngle = null;
-  pushup.downReach = null;
-  pushup.upReach = null;
+  pushup.armed = false;
   pushup.downSince = 0;
   pushup.upSince = 0;
-  pushup.angleThreshold = null;
-  pushup.thresholdRadius = null;
-  pushup.elbowPass = false;
-  pushup.anglePass = false;
-  pushup.circlePass = false;
-  pushup.insideSince = 0;
-  pushup.angleExitSince = 0;
-  pushup.outsideSince = 0;
-  pushup.lastRepAt = 0;
+  pushup.lastRepAt = performance.now();
+  pushup.invalidFrames = 0;
+  pushup.avgAngle = null;
+  pushup.prox = null;
+  pushup.mirrorOk = false;
+  pushup.handsBelow = false;
   pushup.leftAngle = null;
   pushup.rightAngle = null;
-  pushup.leftDist = null;
-  pushup.rightDist = null;
-  pushup.leftInside = false;
-  pushup.rightInside = false;
   pushup.armLength = 0;
 
   state.lastLandmarks = [];
@@ -986,348 +970,111 @@ function resetPushup() {
   state.landmarkFrame = 0;
   updateCaptureNote();
 
-  if (els.skipCalibration && els.skipCalibration.checked) {
-    applyDefaultCalibration(performance.now());
-    return;
-  }
-
-  updateCounterUI();
-  els.armValues.textContent = "elbow pass – · angle pass – · circle pass –";
-  setCounterStatus("Get into push-up pose, then GO DOWN and hold.", "idle");
-  setPosePrompt("GO DOWN FIRST", "Bend your elbows and hold the bottom position.");
-}
-
-function applyDefaultCalibration(now = performance.now()) {
-  const pushup = state.pushup;
-  pushup.phase = "counting";
-  pushup.count = 0;
-  pushup.stanceSince = 0;
-  pushup.startedAt = 0;
-  pushup.samples = [];
-  pushup.downAngle = DEFAULT_DOWN_ANGLE;
-  pushup.upAngle = DEFAULT_UP_ANGLE;
-  pushup.downReach = DEFAULT_DOWN_REACH;
-  pushup.upReach = DEFAULT_UP_REACH;
-  pushup.downSince = 0;
-  pushup.upSince = 0;
-  pushup.angleThreshold = (DEFAULT_DOWN_ANGLE + DEFAULT_UP_ANGLE) / 2;
-  pushup.thresholdRadius = circleThreshold(DEFAULT_DOWN_REACH, DEFAULT_UP_REACH);
-  pushup.elbowPass = false;
-  pushup.anglePass = false;
-  pushup.circlePass = false;
-  pushup.insideSince = 0;
-  pushup.angleExitSince = 0;
-  pushup.outsideSince = 0;
-  pushup.lastRepAt = now;
-
   updateCounterUI();
   els.armValues.textContent =
-    `DOWN ${DEFAULT_DOWN_ANGLE}° · UP ${DEFAULT_UP_ANGLE}° (defaults)`;
+    `DOWN ≤${DOWN_ANGLE_MAX}° · UP ≥${UP_ANGLE_MIN}° · prox ${PROX_DOWN_MAX}/${PROX_UP_MIN}`;
   setPosePrompt(null);
-  setCounterStatus("Calibration disabled. Using default thresholds.", "good");
-}
-
-function averageArm(metrics) {
-  return {
-    angle: (metrics.leftAngle + metrics.rightAngle) / 2,
-    reach: (metrics.leftDist + metrics.rightDist) / 2,
-  };
-}
-
-function circleThreshold(downReach, upReach) {
-  const low = Math.min(downReach, upReach);
-  const high = Math.max(downReach, upReach);
-  return low + (high - low) * CIRCLE_DOWN_BIAS;
-}
-
-function isDownPose(metrics) {
-  if (!metrics || !metrics.inPushupPose) return false;
-  const arm = averageArm(metrics);
-  return arm.reach <= DEFAULT_DOWN_REACH || arm.angle <= DEFAULT_DOWN_ANGLE;
-}
-
-function isUpPose(metrics) {
-  if (!metrics || !metrics.inPushupPose) return false;
-  const arm = averageArm(metrics);
-  return arm.reach >= DEFAULT_UP_REACH && arm.angle >= DEFAULT_UP_ANGLE;
-}
-
-function beginDownCalibration(now) {
-  const pushup = state.pushup;
-  pushup.phase = "calibrating_down";
-  pushup.startedAt = now;
-  pushup.samples = [];
-  els.countdown.textContent = "5";
-  setCalibrationProgress(0);
-  setPosePrompt("HOLD DOWN", "Keep the bottom position still for 5 seconds.");
-  setCounterStatus("Down pose found. Calibrating DOWN for 5 seconds…", "warn");
-}
-
-function beginUpCalibration(now) {
-  const pushup = state.pushup;
-  pushup.phase = "calibrating_up";
-  pushup.startedAt = now;
-  pushup.samples = [];
-  els.countdown.textContent = "5";
-  setCalibrationProgress(0);
-  setPosePrompt("HOLD UP", "Straighten your arms and hold for 5 seconds.");
-  setCounterStatus("Up pose found. Calibrating UP for 5 seconds…", "warn");
-}
-
-function saveCalibrationSample(metrics) {
-  state.pushup.samples.push({
-    leftAngle: metrics.leftAngle,
-    rightAngle: metrics.rightAngle,
-    leftDist: metrics.leftDist,
-    rightDist: metrics.rightDist,
-  });
-  state.pushup.armLength = metrics.armLength;
-}
-
-function medianCalibration() {
-  const samples = state.pushup.samples;
-  const leftAngle = median(samples.map((sample) => sample.leftAngle));
-  const rightAngle = median(samples.map((sample) => sample.rightAngle));
-  const leftDist = median(samples.map((sample) => sample.leftDist));
-  const rightDist = median(samples.map((sample) => sample.rightDist));
-
-  return {
-    angle: (leftAngle + rightAngle) / 2,
-    reach: (leftDist + rightDist) / 2,
-  };
+  setCounterStatus("Get into push-up pose and start counting.", "idle");
 }
 
 function updatePushupCounter(metrics, now) {
   const pushup = state.pushup;
 
-  if (pushup.phase === "waiting_down") {
-    if (isDownPose(metrics)) {
-      if (!pushup.downSince) pushup.downSince = now;
-      if (now - pushup.downSince >= POSE_STABLE_MS) beginDownCalibration(now);
-    } else {
-      pushup.downSince = 0;
-      setCounterStatus("GO DOWN first. Bend your elbows and hold.", "idle");
-      setPosePrompt("GO DOWN FIRST", "Bend your elbows and hold the bottom position.");
-    }
-    return;
-  }
-
-  if (pushup.phase === "calibrating_down") {
-    if (!isDownPose(metrics)) {
-      pushup.startedAt = now;
-      pushup.samples = [];
-      els.countdown.textContent = "5";
-      setCalibrationProgress(0);
-      setPosePrompt("GO DOWN FIRST", "Bend your elbows and hold the bottom position.");
-      setCounterStatus("Hold the DOWN position — countdown restarted.", "warn");
-      return;
-    }
-
-    saveCalibrationSample(metrics);
-    const elapsed = now - pushup.startedAt;
-    const remaining = Math.max(0, Math.ceil((CALIBRATION_MS - elapsed) / 1000));
-    els.countdown.textContent = String(remaining);
-    setCalibrationProgress((elapsed / CALIBRATION_MS) * 100);
-    setCounterStatus(`DOWN calibration… ${remaining}s. Hold still.`, "warn");
-
-    if (elapsed < CALIBRATION_MS) return;
-
-    const down = medianCalibration();
-    if (down.angle > 155 && down.reach > DEFAULT_DOWN_REACH) {
-      pushup.startedAt = now;
-      pushup.samples = [];
-      setCounterStatus("Bend deeper at the BOTTOM and hold.", "warn");
-      return;
-    }
-
-    pushup.downAngle = down.angle;
-    pushup.downReach = down.reach;
-    pushup.phase = "waiting_up";
-    pushup.samples = [];
-    pushup.upSince = 0;
-    els.countdown.textContent = "5";
-    setCalibrationProgress(0);
-    els.armValues.textContent = `DOWN saved · elbow ${Math.round(down.angle)}°`;
-    setPosePrompt("NOW GO UP", "Straighten your arms and hold the top position.");
-    setCounterStatus("DOWN saved. Now GO UP and hold the top.", "good");
-    return;
-  }
-
-  if (pushup.phase === "waiting_up") {
-    if (isUpPose(metrics)) {
-      if (!pushup.upSince) pushup.upSince = now;
-      if (now - pushup.upSince >= POSE_STABLE_MS) beginUpCalibration(now);
-    } else {
-      pushup.upSince = 0;
-      setCounterStatus("Now GO UP. Straighten your arms and hold.", "idle");
-      setPosePrompt("NOW GO UP", "Straighten your arms and hold the top position.");
-    }
-    return;
-  }
-
-  if (pushup.phase === "calibrating_up") {
-    if (!isUpPose(metrics)) {
-      pushup.startedAt = now;
-      pushup.samples = [];
-      els.countdown.textContent = "5";
-      setCalibrationProgress(0);
-      setPosePrompt("NOW GO UP", "Straighten your arms and hold the top position.");
-      setCounterStatus("Hold the UP position — countdown restarted.", "warn");
-      return;
-    }
-
-    saveCalibrationSample(metrics);
-    const elapsed = now - pushup.startedAt;
-    const remaining = Math.max(0, Math.ceil((CALIBRATION_MS - elapsed) / 1000));
-    els.countdown.textContent = String(remaining);
-    setCalibrationProgress((elapsed / CALIBRATION_MS) * 100);
-    setCounterStatus(`UP calibration… ${remaining}s. Hold still.`, "warn");
-
-    if (elapsed < CALIBRATION_MS) return;
-
-    const up = medianCalibration();
-    if (up.angle < 150 && up.reach < 0.95) {
-      pushup.startedAt = now;
-      pushup.samples = [];
-      setCounterStatus("Straighten your arms at the TOP and hold.", "warn");
-      return;
-    }
-
-    pushup.upAngle = up.angle;
-    pushup.upReach = up.reach;
-    pushup.angleThreshold = (pushup.downAngle + up.angle) / 2;
-    pushup.thresholdRadius = circleThreshold(pushup.downReach, up.reach);
-    pushup.phase = "counting";
-    pushup.elbowPass = false;
-    pushup.anglePass = false;
-    pushup.circlePass = false;
-    pushup.insideSince = 0;
-    pushup.angleExitSince = 0;
-    pushup.outsideSince = 0;
-    pushup.lastRepAt = now;
-    updateCounterUI();
-    els.armValues.textContent =
-      `DOWN ${Math.round(pushup.downAngle)}° · UP ${Math.round(up.angle)}°`;
-    setPosePrompt(null);
-    setCounterStatus("DOWN and UP saved. Start push-ups!", "good");
-    return;
-  }
-
   if (pushup.phase !== "counting") return;
 
+  // Grace period: keep the current rep state through brief dropouts instead
+  // of wiping it on a single bad frame.
   if (!metrics || !metrics.inPushupPose) {
-    pushup.elbowPass = false;
-    pushup.anglePass = false;
-    pushup.circlePass = false;
-    pushup.insideSince = 0;
-    pushup.angleExitSince = 0;
-    pushup.outsideSince = 0;
-    pushup.leftInside = false;
-    pushup.rightInside = false;
-    pushup.leftAngle = null;
-    pushup.rightAngle = null;
-    els.armValues.textContent = "elbow pass – · angle pass – · circle pass –";
-    setCounterStatus("Low push-up pose required — standing is ignored.", "warn");
+    pushup.invalidFrames += 1;
+    if (pushup.invalidFrames > GRACE_FRAMES) {
+      pushup.armed = false;
+      pushup.downSince = 0;
+      pushup.upSince = 0;
+      pushup.avgAngle = null;
+      pushup.prox = null;
+      pushup.leftAngle = null;
+      pushup.rightAngle = null;
+      els.armValues.textContent = "Waiting for push-up pose…";
+      setCounterStatus("Waiting for push-up pose — keep hands, arms and hips in view.", "warn");
+    }
     return;
   }
 
+  pushup.invalidFrames = 0;
   pushup.armLength = metrics.armLength;
   pushup.leftAngle = metrics.leftAngle;
   pushup.rightAngle = metrics.rightAngle;
-  pushup.leftDist = metrics.leftDist;
-  pushup.rightDist = metrics.rightDist;
-  pushup.leftInside = metrics.leftDist < pushup.thresholdRadius;
-  pushup.rightInside = metrics.rightDist < pushup.thresholdRadius;
+  pushup.avgAngle = metrics.avgAngle;
+  pushup.prox = metrics.prox;
+  pushup.mirrorOk = metrics.mirrorOk;
+  pushup.handsBelow = metrics.handsBelow;
 
-  const bendLimit = pushup.downAngle - ANGLE_TOLERANCE;
-  const releaseLimit = pushup.downAngle + ANGLE_TOLERANCE;
-  const bothInside = pushup.leftInside && pushup.rightInside;
-  const bothOutside = !pushup.leftInside && !pushup.rightInside;
-  const bothBent = metrics.leftAngle <= bendLimit && metrics.rightAngle <= bendLimit;
-  const bothReleased = metrics.leftAngle >= releaseLimit && metrics.rightAngle >= releaseLimit;
+  const down =
+    metrics.avgAngle <= DOWN_ANGLE_MAX &&
+    metrics.prox <= PROX_DOWN_MAX &&
+    metrics.mirrorOk &&
+    metrics.handsBelow;
+  const up =
+    metrics.avgAngle >= UP_ANGLE_MIN &&
+    metrics.prox >= PROX_UP_MIN &&
+    metrics.mirrorOk &&
+    metrics.handsBelow;
 
   els.armValues.textContent =
-    `Elbow ${Math.round(metrics.leftAngle)}°/${Math.round(metrics.rightAngle)}° · ` +
-    `bend ${pushup.elbowPass ? "✓" : "–"} · angle ${pushup.anglePass ? "✓" : "–"} · ` +
-    `circle ${pushup.circlePass ? "✓" : "–"}`;
+    `Elbow ${Math.round(metrics.leftAngle)}°/${Math.round(metrics.rightAngle)}° (avg ${Math.round(metrics.avgAngle)}°) · ` +
+    `prox ${metrics.prox.toFixed(2)} · ${pushup.armed ? "armed ✓" : "armed –"}`;
 
-  if (bothInside && bothBent) {
-    if (!pushup.insideSince) pushup.insideSince = now;
+  // Arm the rep at the bottom.
+  if (down) {
+    if (!pushup.downSince) pushup.downSince = now;
 
-    if (!pushup.elbowPass && now - pushup.insideSince >= HOLD_MS) {
-      pushup.elbowPass = true;
-      pushup.anglePass = false;
-      pushup.circlePass = false;
-      pushup.angleExitSince = 0;
-      pushup.outsideSince = 0;
+    if (!pushup.armed && now - pushup.downSince >= HOLD_MS) {
+      pushup.armed = true;
+      pushup.upSince = 0;
       sendDotEvent("push_down");
     }
   } else {
-    pushup.insideSince = 0;
+    pushup.downSince = 0;
   }
 
-  if (pushup.elbowPass && bothReleased) {
-    if (!pushup.angleExitSince) pushup.angleExitSince = now;
+  // Count the rep when returning to the top.
+  if (up && pushup.armed) {
+    if (!pushup.upSince) pushup.upSince = now;
 
-    if (!pushup.anglePass && now - pushup.angleExitSince >= HOLD_MS) {
-      pushup.anglePass = true;
+    if (now - pushup.upSince >= HOLD_MS && now - pushup.lastRepAt >= MIN_REP_GAP_MS) {
+      pushup.count += 1;
+      pushup.armed = false;
+      pushup.downSince = 0;
+      pushup.upSince = 0;
+      pushup.lastRepAt = now;
+      updateCounterUI();
+      sendDotEvent("push_up");
+      const reps = pushup.count;
+      setCounterStatus(`${reps} rep${reps === 1 ? "" : "s"} counted. Go down again!`, "good");
+      return;
     }
   } else {
-    pushup.angleExitSince = 0;
+    pushup.upSince = 0;
   }
 
-  if (pushup.elbowPass && bothOutside) {
-    if (!pushup.outsideSince) pushup.outsideSince = now;
-
-    if (!pushup.circlePass && now - pushup.outsideSince >= HOLD_MS) {
-      pushup.circlePass = true;
-    }
+  if (down) {
+    setCounterStatus(pushup.armed ? "Bottom held. Push back up." : "Hold the bottom to arm the rep.", "good");
+  } else if (up && pushup.armed) {
+    setCounterStatus("Hold the top to finish the rep.", "good");
+  } else if (pushup.armed) {
+    setCounterStatus("Armed — push up to the top.", "good");
+  } else if (!metrics.handsBelow) {
+    setCounterStatus("Hands must be below hips in the frame.", "warn");
+  } else if (!metrics.mirrorOk) {
+    setCounterStatus("Arms not mirroring — check your stance.", "warn");
   } else {
-    pushup.outsideSince = 0;
-  }
-
-  if (pushup.anglePass && pushup.circlePass && now - pushup.lastRepAt >= MIN_REP_GAP_MS) {
-    pushup.count += 1;
-    pushup.elbowPass = false;
-    pushup.anglePass = false;
-    pushup.circlePass = false;
-    pushup.insideSince = 0;
-    pushup.angleExitSince = 0;
-    pushup.outsideSince = 0;
-    pushup.lastRepAt = now;
-    updateCounterUI();
-    sendDotEvent("push_up");
-    const reps = pushup.count;
-    setCounterStatus(`${reps} rep${reps === 1 ? "" : "s"} counted. Go down again!`, "good");
-    return;
-  }
-
-  if (pushup.elbowPass && pushup.anglePass && !pushup.circlePass) {
-    setCounterStatus("Angle pass set. Move shoulders out of both circles.", "good");
-  } else if (pushup.elbowPass && pushup.circlePass && !pushup.anglePass) {
-    setCounterStatus("Circle pass set. Straighten elbows to set angle pass.", "good");
-  } else if (bothInside && bothBent) {
-    setCounterStatus(
-      pushup.elbowPass
-        ? "Bend pass set. Straighten elbows to set angle pass."
-        : "Shoulders in circles — hold the bent elbows.",
-      pushup.elbowPass ? "good" : "warn",
-    );
-  } else if (pushup.elbowPass && bothReleased && !pushup.anglePass) {
-    setCounterStatus("Hold straight elbows to set angle pass.", "good");
-  } else if (pushup.elbowPass && bothOutside && !pushup.circlePass) {
-    setCounterStatus("Hold shoulders outside to set circle pass.", "good");
-  } else if (bothInside) {
-    setCounterStatus("Shoulders in circles — bend elbows past calibrated bottom.", "warn");
-  } else if (bothOutside) {
-    setCounterStatus("Shoulders outside — go down into both circles.", "idle");
-  } else {
-    setCounterStatus("Move both shoulders into or out of the circles together.", "warn");
+    setCounterStatus("Go down (bend elbows) then up (straighten).", "idle");
   }
 }
 
 function getPushupMetrics(landmarks) {
-  const head = landmarks[0];
+  const earL = landmarks[7];
+  const earR = landmarks[8];
   const leftShoulder = landmarks[11];
   const rightShoulder = landmarks[12];
   const leftElbow = landmarks[13];
@@ -1338,36 +1085,42 @@ function getPushupMetrics(landmarks) {
   const rightHip = landmarks[24];
 
   const needed = [
-    head, leftShoulder, rightShoulder, leftElbow, rightElbow,
+    earL, earR, leftShoulder, rightShoulder, leftElbow, rightElbow,
     leftWrist, rightWrist, leftHip, rightHip,
   ];
   if (!needed.every(isVisible)) return null;
 
   const shoulder = midpoint(leftShoulder, rightShoulder);
   const hip = midpoint(leftHip, rightHip);
+  const ear = midpoint(earL, earR);
 
   const leftArmLength = distance(leftShoulder, leftElbow) + distance(leftElbow, leftWrist);
   const rightArmLength = distance(rightShoulder, rightElbow) + distance(rightElbow, rightWrist);
   if (leftArmLength < 0.02 || rightArmLength < 0.02) return null;
 
   const armLength = (leftArmLength + rightArmLength) / 2;
-  const handSpan = (
-    distance(leftShoulder, leftWrist) + distance(rightShoulder, rightWrist)
-  ) / 2;
-  if (handSpan < 0.02) return null;
+  const shoulderWidth = distance(leftShoulder, rightShoulder);
+  if (shoulderWidth < 0.02) return null;
 
-  const torsoToHand = distance(shoulder, hip) / handSpan;
-  const headLevel = Math.abs(head.y - shoulder.y) < 0.18;
+  const leftAngle = jointAngle(leftShoulder, leftElbow, leftWrist);
+  const rightAngle = jointAngle(rightShoulder, rightElbow, rightWrist);
+  const avgAngle = (leftAngle + rightAngle) / 2;
+  const prox = (distance(leftWrist, ear) + distance(rightWrist, ear)) / (2 * shoulderWidth);
+  const mirrorOk = Math.abs(leftAngle - rightAngle) <= MIRROR_MAX_DIFF;
+  const handsBelow = ((leftWrist.y - hip.y) + (rightWrist.y - hip.y)) / 2 > HANDS_BELOW_HIP_MIN;
+
+  const headLevel = Math.abs(ear.y - shoulder.y) < 0.18;
   const hipLevel = Math.abs(hip.y - shoulder.y) < 0.38;
-  const lowPushupPose = torsoToHand < TORSO_TO_HAND_MAX;
 
   return {
-    inPushupPose: headLevel && hipLevel && lowPushupPose,
+    inPushupPose: headLevel && hipLevel && handsBelow,
     armLength,
-    leftAngle: jointAngle(leftShoulder, leftElbow, leftWrist),
-    rightAngle: jointAngle(rightShoulder, rightElbow, rightWrist),
-    leftDist: distance(leftShoulder, leftWrist) / leftArmLength,
-    rightDist: distance(rightShoulder, rightWrist) / rightArmLength,
+    leftAngle,
+    rightAngle,
+    avgAngle,
+    prox,
+    mirrorOk,
+    handsBelow,
   };
 }
 
@@ -1389,12 +1142,6 @@ function jointAngle(start, joint, end) {
   let difference = Math.abs(startAngle - endAngle) * (180 / Math.PI);
   if (difference > 180) difference = 360 - difference;
   return difference;
-}
-
-function median(values) {
-  const sorted = [...values].sort((a, b) => a - b);
-  const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
 function copyLandmark(point) {
@@ -1438,21 +1185,19 @@ function buildExportData(choice) {
   if (choice === "all" || choice === "calibration") {
     data.calibration = {
       phase: pushup.phase,
-      downAngle: pushup.downAngle,
-      upAngle: pushup.upAngle,
-      downReach: pushup.downReach,
-      upReach: pushup.upReach,
-      angleThreshold: pushup.angleThreshold,
-      thresholdRadius: pushup.thresholdRadius,
+      upAngleMin: UP_ANGLE_MIN,
+      downAngleMax: DOWN_ANGLE_MAX,
+      proxUpMin: PROX_UP_MIN,
+      proxDownMax: PROX_DOWN_MAX,
+      mirrorMaxDiff: MIRROR_MAX_DIFF,
+      handsBelowHipMin: HANDS_BELOW_HIP_MIN,
     };
   }
 
   if (choice === "all" || choice === "counter") {
     data.counter = {
       count: pushup.count,
-      elbowPass: pushup.elbowPass,
-      anglePass: pushup.anglePass,
-      circlePass: pushup.circlePass,
+      armed: pushup.armed,
       lastRepAt: pushup.lastRepAt,
     };
   }
@@ -1513,65 +1258,26 @@ function applyImportedData(data) {
   }
 
   const pushup = state.pushup;
-  const calibration = data.calibration || {};
-  const aliases = {
-    downAngle: ["downAngle", "bottomAngle"],
-    upAngle: ["upAngle", "topAngle"],
-    downReach: ["downReach", "bottomDist"],
-    upReach: ["upReach", "topDist"],
-    angleThreshold: ["angleThreshold"],
-    thresholdRadius: ["thresholdRadius"],
-  };
 
-  for (const [target, names] of Object.entries(aliases)) {
-    const value = names.map((name) => calibration[name]).find(Number.isFinite);
-    if (value !== undefined) pushup[target] = value;
-  }
-
-  if (Number.isFinite(pushup.downReach) && Number.isFinite(pushup.upReach)) {
-    pushup.thresholdRadius = circleThreshold(pushup.downReach, pushup.upReach);
-  }
-
-  const hasCalibration =
-    Number.isFinite(pushup.downAngle) &&
-    Number.isFinite(pushup.upAngle) &&
-    Number.isFinite(pushup.downReach) &&
-    Number.isFinite(pushup.upReach) &&
-    Number.isFinite(pushup.thresholdRadius);
-
-  if (hasCalibration) {
-    pushup.phase = "counting";
-    pushup.elbowPass = false;
-    pushup.anglePass = false;
-    pushup.circlePass = false;
-    pushup.insideSince = 0;
-    pushup.angleExitSince = 0;
-    pushup.outsideSince = 0;
-    pushup.lastRepAt = performance.now();
-    els.armValues.textContent =
-      `DOWN ${Math.round(pushup.downAngle)}° · UP ${Math.round(pushup.upAngle)}°`;
-    setPosePrompt(null);
-    setCounterStatus("Imported calibration. Start push-ups!", "good");
-  } else {
-    pushup.phase = "waiting_down";
-    setPosePrompt("GO DOWN FIRST", "Bend your elbows and hold the bottom position.");
-    setCounterStatus("Imported file has no complete calibration. Calibrate first.", "warn");
-  }
+  // Thresholds are fixed constants now, so there is nothing to restore
+  // from old calibration data. Just reset to counting mode.
+  pushup.phase = "counting";
+  pushup.armed = false;
+  pushup.downSince = 0;
+  pushup.upSince = 0;
+  pushup.invalidFrames = 0;
+  pushup.lastRepAt = performance.now();
 
   if (Number.isFinite(data.counter?.count)) {
     pushup.count = Math.max(0, data.counter.count);
+  } else {
+    pushup.count = 0;
   }
-  if (typeof data.counter?.elbowPass === "boolean") {
-    pushup.elbowPass = data.counter.elbowPass;
-  } else if (typeof data.counter?.inside === "boolean") {
-    pushup.elbowPass = data.counter.inside;
-  }
-  if (typeof data.counter?.anglePass === "boolean") {
-    pushup.anglePass = data.counter.anglePass;
-  }
-  if (typeof data.counter?.circlePass === "boolean") {
-    pushup.circlePass = data.counter.circlePass;
-  }
+
+  els.armValues.textContent =
+    `DOWN ≤${DOWN_ANGLE_MAX}° · UP ≥${UP_ANGLE_MIN}° · prox ${PROX_DOWN_MAX}/${PROX_UP_MIN}`;
+  setPosePrompt(null);
+  setCounterStatus("Imported. Start push-ups!", "good");
 
   state.lastLandmarks = cleanFrame(data.latestDots) || [];
   state.landmarkHistory = Array.isArray(data.recentDots)
@@ -1595,10 +1301,6 @@ function applyImportedData(data) {
 
   updateCaptureNote();
   updateCounterUI();
-
-  if (els.skipCalibration && els.skipCalibration.checked) {
-    applyDefaultCalibration(performance.now());
-  }
 }
 
 function setCalibrationProgress(percent) {
@@ -1618,19 +1320,11 @@ function setCounterStatus(text, kind = "idle") {
 
 function updateCounterUI() {
   const pushup = state.pushup;
-  const calibrating = ["waiting_down", "calibrating_down", "waiting_up", "calibrating_up"].includes(pushup.phase);
-  const counting = pushup.phase === "counting";
 
   els.repCount.textContent = String(pushup.count);
   els.hudReps.textContent = String(pushup.count);
-  els.calibrationPill.hidden = !calibrating;
-
-  if (calibrating) {
-    els.countdown.textContent = "5";
-    setCalibrationProgress(0);
-  } else {
-    setCalibrationProgress(counting ? 100 : 0);
-  }
+  els.calibrationPill.hidden = true;
+  setCalibrationProgress(100);
 }
 
 function schedulePoseOptions() {

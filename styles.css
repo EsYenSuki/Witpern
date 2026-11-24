@@ -284,6 +284,55 @@ canvas {
   transform: translateY(0);
 }
 
+.pose-meter {
+  padding: 12px 4px 0;
+}
+
+.pose-meter-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.pose-meter-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pose-meter-value {
+  color: var(--cyan);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.pose-meter-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+}
+
+.pose-meter-fill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--cyan), var(--lime));
+  transition: width 100ms linear;
+}
+
+.pose-meter-scale {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 5px;
+  color: #64748b;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
 .transport {
   display: flex;
   flex-wrap: wrap;

@@ -20,6 +20,8 @@ The camera starts automatically when the page opens. Camera controls are availab
 - **Close camera** — stops the camera track and resets the counter.
 - **Front / Back** — switches camera direction and restarts the camera if it is open.
 
+A **Down probability** bar under the video fills as your average elbow angle moves from the UP threshold toward the DOWN threshold (0% at ≥152°, 100% at ≤125°). It is smoothed frame to frame and resets when tracking is lost or the camera closes.
+
 ## Raw dots, export and import
 
 In the push-up counter card:
@@ -57,25 +59,25 @@ the username/password from `server/.env` (see `.env.example`). See `server/READM
 
 ## How it works
 
-No calibration is needed. The counter uses fixed thresholds derived from sample pose data:
+No calibration is needed. The counter uses fixed thresholds derived from sample pose data. Angles and proximity are smoothed frame to frame before these checks run:
 
 1. The page opens the camera automatically.
-2. Counting is enabled when ears, shoulders, elbows, wrists and hips are all visible, and the body is in a push-up stance: head level with shoulders, hips level with shoulders, and both hands below the hips in the frame. This blocks standing or raised poses from counting.
-3. **Elbow angle** (shoulder–elbow–wrist) is the primary signal, averaged across both arms:
-   - **DOWN** — average angle ≤ 155°
-   - **UP** — average angle ≥ 163°
-   - The 156–162° gap is a deadband so jitter cannot flip states.
-4. **Wrist-to-ear proximity** (distance from each wrist to the ear midpoint, divided by shoulder width) is a confirmation signal:
-   - **DOWN** — proximity ≤ 1.90
-   - **UP** — proximity ≥ 1.80
-5. **Mirror check** — the left and right elbow angles must differ by no more than 70°, since the front-view camera sees both arms symmetrically.
-6. **Hands-below-hips** — both wrists must sit below the hip line in the image (average `wrist.y − hip.y > 0.03`). This replaces the old torso-ratio gate and does not reject valid push-up stances.
-7. A rep is counted when the body holds the **DOWN** pose for 100 ms (arming the rep), then returns to and holds the **UP** pose for 100 ms. A 200 ms minimum gap between reps prevents double counts.
-8. A 5-frame **grace period** keeps the current state through brief wrist dropouts instead of immediately resetting.
+2. Counting is enabled when the head, shoulders, elbows and wrists are visible, and the body is in a push-up stance: head level with shoulders, not standing upright, and hands near or below hip level. The hip may be briefly occluded at the bottom of a rep.
+3. **Elbow angle** (shoulder–elbow–wrist) is the primary signal, averaged across both visible arms. The DOWN and UP tests are mutually exclusive:
+   - **DOWN** — average angle ≤ 125°, or ≤ 118° on its own (unambiguous bend from a side/angled view)
+   - **UP** — average angle ≥ 152°
+   - The 125–152° band is a deadband, except for the unambiguous-bend and proximity cases below.
+4. **Wrist-to-ear proximity** (distance from each wrist to the ear midpoint, divided by a stable body scale) confirms the angle:
+   - **DOWN** — proximity ≤ 1.05 with angle ≤ 125°, or proximity ≤ 0.92 with angle ≤ 145° (tucked-elbow front push-up)
+   - **UP** — proximity ≥ 1.15 with angle ≥ 152°, or proximity ≥ 1.0 with angle ≥ 162°
+5. **Mirror check** — when both arms are visible, their elbow angles must differ by no more than 70°.
+6. **Hands-below-hips** — the average wrist position must sit no more than 0.18 body-scale units above the hips. A torso-vertical ratio below 0.90 blocks standing poses from counting.
+7. A rep is armed by holding the **DOWN** pose for 80 ms, then counted after returning to and holding the **UP** pose for 80 ms. A 250 ms minimum gap between reps prevents double counts.
+8. An 850 ms time-based **grace period** preserves the current rep state through brief tracking dropouts; hips can stay occluded for up to 2500 ms while a rep is armed.
 
 The overlay shows:
 - arm bones drawn shoulder→elbow→wrist, colored by angle zone (green = down, cyan = up, amber = between)
-- elbow angle in degrees at each elbow
+- a large filled arc at each elbow spanning the measured shoulder–elbow–wrist angle, with a larger degree label beside it; both glow when the angle passes a DOWN or UP threshold
 - dashed line from ear midpoint to each wrist, colored by proximity zone
 - proximity value and mirror check status near the ear
 
@@ -84,5 +86,5 @@ The overlay shows:
 - No backend, no build step, no package install.
 - Plain HTML, CSS, JavaScript, and CDN-loaded MediaPipe Pose.
 - Video frames are processed in the browser and are not uploaded.
-- Phones use the lighter pose model and default to the back camera.
+- Phones default to the back camera; the full pose model is used on all devices.
 - An internet connection is needed to load the MediaPipe model files the first time.

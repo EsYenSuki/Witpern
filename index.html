@@ -54,6 +54,28 @@
             </div>
           </div>
 
+          <div class="pose-meter">
+            <div class="pose-meter-head">
+              <span class="pose-meter-label">Down probability</span>
+              <output class="pose-meter-value" id="downProbabilityValue">0%</output>
+            </div>
+            <div
+              class="pose-meter-track"
+              id="downProbabilityTrack"
+              role="progressbar"
+              aria-label="Push-up down pose probability"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <div class="pose-meter-fill" id="downProbabilityFill"></div>
+            </div>
+            <div class="pose-meter-scale">
+              <span>UP ≥152°</span>
+              <span>DOWN ≤125°</span>
+            </div>
+          </div>
+
           <div class="transport">
             <button class="btn primary" id="openCameraBtn" type="button">Open camera</button>
             <button class="btn" id="closeCameraBtn" type="button">Close camera</button>

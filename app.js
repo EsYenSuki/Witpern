@@ -69,6 +69,8 @@ const state = {
   fpsFrames: 0,
   fpsStartedAt: 0,
   lastTrackingStatus: "",
+  downProbability: 0,
+  downProbabilityAt: 0,
   isMobile: coarsePointer || window.innerWidth <= 560,
   facingMode: coarsePointer ? "environment" : "user",
   lastLandmarks: [],
@@ -170,6 +172,9 @@ function cacheElements() {
   els.videoWrap = document.getElementById("videoWrap");
   els.video = document.getElementById("video");
   els.overlay = document.getElementById("overlay");
+  els.downProbabilityValue = document.getElementById("downProbabilityValue");
+  els.downProbabilityTrack = document.getElementById("downProbabilityTrack");
+  els.downProbabilityFill = document.getElementById("downProbabilityFill");
   els.placeholder = document.getElementById("placeholder");
   els.placeholderTitle = document.getElementById("placeholderTitle");
   els.placeholderText = document.getElementById("placeholderText");
@@ -471,6 +476,7 @@ function onResults(results) {
     clearOverlay();
     els.landmarkCount.textContent = "0";
     setTrackingStatus("No body found", "searching");
+    updateDownProbability(null, now);
     updatePushupCounter(null, now);
     return;
   }
@@ -486,6 +492,7 @@ function onResults(results) {
   storeLandmarks(landmarks);
 
   const metrics = getPushupMetrics(landmarks, now);
+  updateDownProbability(metrics, now);
   updatePushupCounter(metrics, now);
 
   if (metrics && els.showSkeleton.checked) {
@@ -934,6 +941,10 @@ function drawThresholdGuides(landmarks, metrics) {
     return "#fbbf24";
   };
 
+  const anglePassed = (a) =>
+    metrics.inPushupPose &&
+    (pushup.isDown || pushup.isUp || a <= DOWN_ANGLE_MAX || a >= UP_ANGLE_MIN);
+
   const proxColor = !metrics.inPushupPose
     ? "#94a3b8"
     : pushup.isDown || (displayProx != null && displayProx <= PROX_DOWN_MAX)
@@ -969,6 +980,7 @@ function drawThresholdGuides(landmarks, metrics) {
     const wx = arm.wrist.x * width;
     const wy = arm.wrist.y * height;
     const color = angleColor(arm.angle);
+    const lit = anglePassed(arm.angle);
 
     // Head → wrist proximity line.
     if (head) {
@@ -1000,6 +1012,33 @@ function drawThresholdGuides(landmarks, metrics) {
     ctx.stroke();
     ctx.globalAlpha = 1;
 
+    // Filled circular sector spanning the shoulder→elbow→wrist angle.
+    const shoulderAngle = Math.atan2(sy - ey, sx - ex);
+    const wristAngle = Math.atan2(wy - ey, wx - ex);
+    let sweep = wristAngle - shoulderAngle;
+    if (sweep > Math.PI) sweep -= Math.PI * 2;
+    if (sweep < -Math.PI) sweep += Math.PI * 2;
+    const midAngle = shoulderAngle + sweep / 2;
+    const arcRadius = Math.max(18, width * 0.032);
+
+    ctx.save();
+    if (lit) {
+      ctx.shadowColor = color;
+      ctx.shadowBlur = Math.max(10, width * 0.014);
+    }
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.arc(ex, ey, arcRadius, shoulderAngle, shoulderAngle + sweep, sweep < 0);
+    ctx.closePath();
+    ctx.globalAlpha = lit ? 0.3 : 0.18;
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.globalAlpha = lit ? 1 : 0.9;
+    ctx.lineWidth = lit ? Math.max(2.5, width * 0.003) : Math.max(1.5, width * 0.0018);
+    ctx.strokeStyle = color;
+    ctx.stroke();
+    ctx.restore();
+
     ctx.fillStyle = color;
     ctx.beginPath();
     ctx.arc(ex, ey, Math.max(3, width * 0.005), 0, Math.PI * 2);
@@ -1008,14 +1047,16 @@ function drawThresholdGuides(landmarks, metrics) {
     ctx.arc(wx, wy, Math.max(3, width * 0.005), 0, Math.PI * 2);
     ctx.fill();
 
+    const labelOffset = arcRadius + Math.max(10, width * 0.01);
     drawReadableText(
       ctx,
       `${arm.label} ${Math.round(arm.angle)}°`,
-      ex,
-      ey - Math.max(10, width * 0.012),
+      ex + Math.cos(midAngle) * labelOffset,
+      ey + Math.sin(midAngle) * labelOffset,
       width,
       color,
-      0.9,
+      1.25,
+      lit,
     );
   }
 
@@ -1040,7 +1081,7 @@ function drawThresholdGuides(landmarks, metrics) {
   }
 }
 
-function drawReadableText(ctx, text, x, y, width, color, scale = 1) {
+function drawReadableText(ctx, text, x, y, width, color, scale = 1, glow = false) {
   ctx.save();
   ctx.font = `700 ${Math.max(10, width * 0.013 * scale)}px Inter, system-ui, sans-serif`;
   ctx.textAlign = "center";
@@ -1048,6 +1089,10 @@ function drawReadableText(ctx, text, x, y, width, color, scale = 1) {
   ctx.lineWidth = Math.max(2, width * 0.002);
   ctx.strokeStyle = "rgba(2, 6, 23, 0.9)";
   ctx.fillStyle = color;
+  if (glow) {
+    ctx.shadowColor = color;
+    ctx.shadowBlur = Math.max(8, width * 0.012);
+  }
 
   if (els.mirror.checked) {
     ctx.translate(width, 0);
@@ -1125,6 +1170,9 @@ function resetPushupState(count = 0) {
   pushup.rightAngle = null;
   pushup.armLength = 0;
   pushup.trackedArms = "";
+  state.downProbability = 0;
+  state.downProbabilityAt = 0;
+  setDownProbability(0);
 }
 
 function resetPushup() {
@@ -1633,6 +1681,40 @@ function setCalibrationProgress(percent) {
   const value = Math.max(0, Math.min(100, Math.round(percent)));
   els.calibrationBar.style.width = `${value}%`;
   els.calibrationTrack.setAttribute("aria-valuenow", String(value));
+}
+
+function updateDownProbability(metrics, now) {
+  if (!metrics || !Number.isFinite(metrics.avgAngle)) {
+    state.downProbability = 0;
+    state.downProbabilityAt = 0;
+    setDownProbability(0);
+    return;
+  }
+
+  // 0% at a straight-arm angle, 100% at the DOWN threshold and below.
+  const raw = Math.max(
+    0,
+    Math.min(1, (UP_ANGLE_MIN - metrics.avgAngle) / (UP_ANGLE_MIN - DOWN_ANGLE_MAX)),
+  );
+
+  if (!state.downProbabilityAt) {
+    state.downProbability = raw;
+  } else {
+    const dt = Math.min(250, Math.max(1, now - state.downProbabilityAt));
+    const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_MS);
+    state.downProbability += alpha * (raw - state.downProbability);
+  }
+  state.downProbabilityAt = now;
+  setDownProbability(state.downProbability);
+}
+
+function setDownProbability(value) {
+  const percent = Math.max(0, Math.min(100, Math.round(value * 100)));
+  if (els.downProbabilityTrack.getAttribute("aria-valuenow") === String(percent)) return;
+
+  els.downProbabilityFill.style.width = `${percent}%`;
+  els.downProbabilityValue.textContent = `${percent}%`;
+  els.downProbabilityTrack.setAttribute("aria-valuenow", String(percent));
 }
 
 function setCounterStatus(text, kind = "idle") {
